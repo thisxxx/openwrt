@@ -52,16 +52,43 @@ if [ $? -ne 0 ] || [ ! -s "$FULL" ]; then
 	exit 1
 fi
 
-# ---------- 2. 探活写死 IP 的那些 ----------
+# ---------- 2. 探活：写死 IP 的和 cname 上游都要验 ----------
+#
+# 关键点：cname 类以前不探活，因为不知道客户端最终会连到哪个 IP。
+# 但这类恰恰是"反代挂了但域名还解析得到"的情况——不探活就会写死一条死路。
+# 现在先把 forward 域名解析成 IP，和 address 类的 IP 一起探，一个通的就算活。
 DEAD="$TMP/dead.txt"
+DEAD_DOM="$TMP/dead-domains.txt"
+FWD="$TMP/cname-fwd.txt"
 : > "$DEAD"
-if [ "$HC" = "1" ] && command -v steamaccel-probe >/dev/null 2>&1; then
-	# address=/domain/1.2.3.4 里抽出所有 IP
-	sed -n 's|^address=/[^/]*/\([0-9][0-9.]*\)$|\1|p' "$FULL" | sort -u > "$TMP/ips.txt"
-	if [ -s "$TMP/ips.txt" ]; then
-		timeout 25 steamaccel-probe -p 443 -t "$probe_timeout" -c 32 -r 2 \
-			< "$TMP/ips.txt" 2>/dev/null | awk '$3=="timeout"{print $4}' > "$DEAD"
-	fi
+: > "$DEAD_DOM"
+
+sed -n 's|^cname=[^,]*,\(.*\)$|\1|p' "$FULL" | sort -u > "$FWD"
+
+# 汇总所有候选 IP：address 行的 + cname 上游解析出来的
+{
+	sed -n 's|^address=/[^/]*/\([0-9][0-9.]*\)$|\1|p' "$FULL"
+	while IFS= read -r d; do
+		[ -n "$d" ] || continue
+		resolveip -4 "$d" 2>/dev/null
+	done < "$FWD"
+} | grep -E '^[0-9]+\.' | sort -u > "$TMP/ips.txt"
+
+if [ "$HC" = "1" ] && command -v steamaccel-probe >/dev/null 2>&1 && [ -s "$TMP/ips.txt" ]; then
+	timeout 25 steamaccel-probe -p 443 -t "$probe_timeout" -c 32 -r 2 \
+		< "$TMP/ips.txt" 2>/dev/null | awk '$3=="timeout"{print $4}' > "$DEAD"
+fi
+
+# 把"所有 IP 都不通"的 cname 上游记下来，落地时整条剔除
+if [ -s "$DEAD" ] && [ -s "$FWD" ]; then
+	while IFS= read -r d; do
+		[ -n "$d" ] || continue
+		alive=0
+		for ip in $(resolveip -4 "$d" 2>/dev/null); do
+			if ! grep -qxF "$ip" "$DEAD"; then alive=1; break; fi
+		done
+		[ "$alive" = "0" ] && echo "$d" >> "$DEAD_DOM"
+	done < "$FWD"
 fi
 
 # ---------- 3. 落地 ----------
@@ -79,6 +106,13 @@ fi
 				continue
 			fi
 			;;
+		cname=*)
+			fwd=${line#cname=}
+			fwd=${fwd#*,}
+			if [ -s "$DEAD_DOM" ] && grep -qxF "$fwd" "$DEAD_DOM"; then
+				continue
+			fi
+			;;
 		esac
 		echo "$line"
 	done
@@ -86,6 +120,18 @@ fi
 
 mv "$OUT.tmp" "$OUT"
 chmod 644 "$OUT"
+
+# ---------- 3b. 输出"优先通道"IP 清单，给 warp-wg 做直连白名单 ----------
+#
+# warp-wg 的分流是"国内直连、其余走隧道"。但公益反代的 IP 在境外，
+# 不加这个白名单就会被隧道抢走 —— 变成 客户端→WARP→Akamai 反代→源站 的绕路。
+# 有了这份清单，规则通道命中时直连，WARP 只在通道真不通时才接手。
+{
+	sed -n 's|^address=/[^/]*/\([0-9][0-9.]*\)$|\1|p' "$OUT"
+	grep '^cname=' "$OUT" 2>/dev/null | sed 's|^cname=[^,]*,||' | while IFS= read -r d; do
+		[ -n "$d" ] && resolveip -4 "$d" 2>/dev/null
+	done
+} | grep -E '^[0-9]+\.' | sort -u > "$TMP/bypass.txt"
 
 # ---------- 4. SNI 分流（可选，需要 nginx） ----------
 if [ "$sni_enabled" = "1" ] && command -v nginx >/dev/null 2>&1; then
@@ -98,6 +144,13 @@ if [ "$sni_enabled" = "1" ] && command -v nginx >/dev/null 2>&1; then
 fi
 
 /etc/init.d/dnsmasq reload >/dev/null 2>&1
+
+# ---------- 3c. 通知分流层刷新"优先通道"清单 ----------
+# 规则每天会变，bypass.txt 跟着变，但 nft 的 set 不会自己更新。
+# 不刷新的话，新出现的反代 IP 会被隧道的默认规则抢走，白白绕远。
+if [ -x /usr/bin/warp-route ] && nft list table inet warp >/dev/null 2>&1; then
+	/usr/bin/warp-route fast >/dev/null 2>&1 && log "warp fast set refreshed"
+fi
 
 # ---------- 5. 状态，给 LuCI 读 ----------
 total=$(grep -c '^\(address\|cname\)=' "$OUT" 2>/dev/null)

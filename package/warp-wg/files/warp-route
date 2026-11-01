@@ -82,11 +82,15 @@ do_up() {
 	nft add table inet $TABLE || return 1
 	nft add set inet $TABLE cn4 '{ type ipv4_addr; flags interval; auto-merge; }'
 	nft add set inet $TABLE cn6 '{ type ipv6_addr; flags interval; auto-merge; }'
+	# fast = 规则加速通道的目标 IP（公益反代 / 优选 IP），优先直连，不进隧道
+	nft add set inet $TABLE fast '{ type ipv4_addr; flags interval; auto-merge; }'
 	nft add chain inet $TABLE pre '{ type filter hook prerouting priority -140; policy accept; }'
 	nft add chain inet $TABLE out '{ type route hook output priority -140; policy accept; }'
 
 	fill_set cn4 "$STATE/chnroute.txt"  ip
 	[ -f "$STATE/chnroute6.txt" ] && fill_set cn6 "$STATE/chnroute6.txt" ip6
+	# steamaccel 每次 apply 都会重写这份清单
+	[ -s /tmp/steamaccel/bypass.txt ] && fill_set fast /tmp/steamaccel/bypass.txt ip
 
 	# --- prerouting：LAN 进来的流量 ---
 	# 已经打标的放行，避免二次处理
@@ -96,6 +100,10 @@ do_up() {
 	# 保留地址段直连
 	nft add rule inet $TABLE pre ip daddr '{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }' return
 	nft add rule inet $TABLE pre ip6 daddr '{ ::1/128, fc00::/7, fe80::/10, ff00::/8 }' return
+
+	# 第一优先级：规则加速通道。这些 IP 是公益反代或优选出来的直连 IP，
+	# 走隧道反而绕远，所以必须在 cn 判断之前放行。
+	nft add rule inet $TABLE pre ip daddr @fast return
 
 	if [ "$SPLIT" = "china" ]; then
 		nft add rule inet $TABLE pre ip  daddr @cn4 return
@@ -113,6 +121,7 @@ do_up() {
 	# --- output：路由器自身发起的流量（DNS 查询等）---
 	nft add rule inet $TABLE out meta mark $MARK return
 	nft add rule inet $TABLE out ip daddr '{ 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }' return
+	nft add rule inet $TABLE out ip daddr @fast return
 	if [ "$SPLIT" = "china" ]; then
 		nft add rule inet $TABLE out ip daddr @cn4 return
 	fi
@@ -138,6 +147,21 @@ do_up() {
 # 假 IP 也可能落在境外段走隧道，但连不上真站点。
 dns_up() {
 	[ "$SPLIT" = "china" ] || return 0
+
+	# 必须等隧道真的握手成功再切 DNS。否则 1.1.1.1 的路由已指向 warp0 但隧道不通，
+	# 整网解析会先断掉几十秒 —— 这是这类方案最容易把人坑到的一个点。
+	local hs="" i=0
+	while [ $i -lt 12 ]; do
+		hs=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk -v p="$PEER" '$1==p{print $2}')
+		[ -n "$hs" ] && [ "$hs" != "0" ] && break
+		sleep 0.5
+		i=$((i+1))
+	done
+	if [ -z "$hs" ] || [ "$hs" = "0" ]; then
+		log "隧道尚未握手，暂不切换 DNS（保持系统默认上游，避免整网断解析）"
+		return 0
+	fi
+
 	local f=/tmp/dnsmasq.d/warp-dns.conf
 	mkdir -p /tmp/dnsmasq.d
 	{
@@ -154,13 +178,10 @@ dns_up() {
 		echo "all-servers"
 	} > "$f"
 
-	# 全局隧道生效时，steamaccel 的公益反代规则必须让位：
-	# 那些反代 IP 在境外，若还挂在 dnsmasq 上，解析结果会被 IP 分流判成"走隧道"，
-	# 变成"客户端→WARP→Akamai 反代→Steam"的绕路，反而更慢。
-	if [ -s /tmp/dnsmasq.d/steamaccel.conf ]; then
-		mv /tmp/dnsmasq.d/steamaccel.conf /tmp/dnsmasq.d/steamaccel.conf.off 2>/dev/null
-		log "已临时停用 steamaccel 的域名改写（全局隧道优先）"
-	fi
+	# steamaccel 的 cname/address 规则保留：它们是精确匹配，优先级高于这里的
+	# server=/domain/ 通配。规则通道命中的域名走公益反代，其余才落到隧道 DNS。
+	# 只有规则探活失败（steamaccel 自己会把那条剔掉）时，域名才会回到这里的
+	# server= 分支，经由隧道查询 —— 这就是"通道不通自动转 WARP"的落点。
 
 	/etc/init.d/dnsmasq reload >/dev/null 2>&1
 	log "DNS 分流已启用（国内→$DNS_CN，其余→$DNS_VIA）"
@@ -168,7 +189,7 @@ dns_up() {
 
 dns_down() {
 	local f=/tmp/dnsmasq.d/warp-dns.conf
-	# 恢复被临时停用的 steamaccel 规则
+	# 兼容旧版本留下的临时停用文件
 	[ -f /tmp/dnsmasq.d/steamaccel.conf.off ] && \
 		mv /tmp/dnsmasq.d/steamaccel.conf.off /tmp/dnsmasq.d/steamaccel.conf 2>/dev/null
 	[ -f "$f" ] || return 0
@@ -195,6 +216,11 @@ do_status() {
 	config_get SPLIT cfg split_mode china
 	echo "分流: 已启用（$SPLIT）"
 	echo "国内段条目: $(nft list set inet $TABLE cn4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' | wc -l)"
+	if nft list set inet $TABLE fast >/dev/null 2>&1; then
+		local fn
+		fn=$(nft list set inet $TABLE fast 2>/dev/null | tr ',' '\n' | grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+		echo "规则通道直连条目: $fn"
+	fi
 	echo "路由表 $RT_TABLE:"
 	ip route show table $RT_TABLE 2>/dev/null | sed 's/^/  /'
 	echo "规则:"
@@ -212,10 +238,21 @@ do_status() {
 	fi
 }
 
+# 只重灌 fast 集合，不动其它规则。steamaccel 每天更新规则后调这个，
+# 避免为了几条 IP 变化去重建整张表（重建会短暂断流）。
+do_fast() {
+	nft list table inet $TABLE >/dev/null 2>&1 || { log "分流未启用，跳过"; return 0; }
+	[ -s /tmp/steamaccel/bypass.txt ] || { log "bypass.txt 不存在，跳过"; return 0; }
+	nft flush set inet $TABLE fast 2>/dev/null
+	fill_set fast /tmp/steamaccel/bypass.txt ip
+	log "规则通道直连清单已刷新"
+}
+
 case "$1" in
 	up)     do_up ;;
 	down)   do_down ;;
 	reload) do_down silent; do_up ;;
+	fast)   do_fast ;;
 	status) do_status ;;
-	*)      echo "用法: $0 {up|down|reload|status}"; exit 1 ;;
+	*)      echo "用法: $0 {up|down|reload|fast|status}"; exit 1 ;;
 esac
