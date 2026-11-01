@@ -216,12 +216,55 @@ jobs:
           fi
 
           echo "::group::squashfs 内容抽查"
-          unsquashfs -ls "$img" 2>/dev/null | grep -E 'usr/bin/(easytier-core|steamaccel-probe|steamaccel-update|steamaccel-apply)|etc/init\.d/(steamaccel|easytier)|usr/lib/steamaccel/gen\.lua|usr/share/steamaccel/rules\.json|view/steamaccel' \
-            || { echo "::error::关键文件没进 squashfs"; exit 1; }
-          echo "::endgroup::"
+          # sysupgrade.bin 是 header + kernel + squashfs 拼起来的，unsquashfs 从文件头
+          # 读不到超级块（magic 在中间），必须先按 magic 'hsqs' 定位偏移再解。
+          # kernel 里也可能偶然出现 hsqs 字节串，所以逐个候选试 -s，能解析的才算。
+          cands=$(grep -abo 'hsqs' "$img" | cut -d: -f1 | head -8 || true)
+          echo "hsqs 候选偏移: $(echo $cands | tr '\n' ' ')"
+          off=""
+          for o in $cands; do
+            if unsquashfs -o "$o" -s "$img" >/dev/null 2>&1; then off="$o"; break; fi
+          done
+          [ -n "$off" ] || { echo "::error::镜像里找不到可解析的 squashfs 超级块"; exit 1; }
+          echo "采用偏移 = $off"
+          unsquashfs -o "$off" -ls "$img" > sq.txt 2>sq.err \
+            || { echo "::error::unsquashfs 失败"; cat sq.err; exit 1; }
+          echo "条目数 $(wc -l < sq.txt)"
 
-          echo "::group::easytier-core 字节数（必须等于源文件）"
-          unsquashfs -ll "$img" 2>/dev/null | grep 'usr/bin/easytier-core' | head -2
+          miss=0
+          # 路径必须与各包 Makefile 的 install 段一致，写错一处这里就会全绿但刷机后是空壳
+          for p in \
+            usr/bin/easytier-core \
+            usr/bin/steamaccel-probe \
+            usr/sbin/steamaccel-update \
+            usr/sbin/steamaccel-apply \
+            usr/sbin/steamaccel-sync \
+            usr/lib/steamaccel/gen.lua \
+            usr/share/steamaccel/rules.json \
+            etc/steamaccel/extra.tsv \
+            etc/init.d/steamaccel \
+            etc/init.d/easytier \
+            etc/init.d/warp-wg \
+            etc/hotplug.d/iface/90-steamaccel \
+            usr/bin/warp-register \
+            usr/bin/warp-scan \
+            usr/bin/warp-route \
+            usr/bin/warp-status \
+            etc/warp-wg/chnroute.txt \
+            etc/warp-wg/endpoints.txt \
+            www/luci-static/resources/view/steamaccel/overview.js \
+            www/luci-static/resources/view/steamaccel/warp.js ; do
+            if grep -q "$p" sq.txt; then echo "OK   $p"; else echo "MISS $p"; miss=$((miss+1)); fi
+          done
+
+          # easytier-core 与源文件必须字节一致，防止被 strip / upx 二次处理
+          got=$(unsquashfs -o "$off" -ll "$img" 2>/dev/null | awk '/usr\/bin\/easytier-core$/ {print $3; exit}')
+          echo "镜像内 easytier-core = ${got:-未取到} (源 $EASYTIER_SIZE)"
+          if [ -n "$got" ] && [ "$got" != "$EASYTIER_SIZE" ]; then
+            echo "::error::easytier-core 字节数不符"; exit 1
+          fi
+
+          [ "$miss" -eq 0 ] || { echo "::error::$miss 个关键文件没进镜像"; exit 1; }
           echo "::endgroup::"
 
           echo "::group::体积明细"
@@ -243,6 +286,8 @@ jobs:
 
       # ---------------------------------------------------------------- 上传
       - name: 上传 artifact
+        # 校验失败也要把产物捞出来，否则一次 45 分钟的编译白跑
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: K2P-openwrt-${{ github.sha }}
