@@ -48,9 +48,9 @@ jobs:
 
       - name: 释放磁盘空间
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
-          sudo docker image prune -a -f || true
+          # 只删三块确定大且删得快的。docker prune 和 CodeQL 目录要遍历海量小文件，
+          # 在 runner 上能卡十几分钟，得不偿失。
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc 2>/dev/null || true
           df -h /
 
       - name: 安装构建依赖
