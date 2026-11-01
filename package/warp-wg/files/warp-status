@@ -1,0 +1,67 @@
+#!/bin/sh
+# warp-status —— 给 LuCI 和命令行共用的状态汇总
+# 无参数输出人类可读；--json 输出给前端
+
+CFG=warp-wg
+TABLE=warp
+
+config_load "$CFG"
+config_get ENABLED  cfg enabled           "0"
+config_get IFACE    cfg ifname            "warp0"
+config_get PEER     cfg peer_public_key   ""
+config_get ADDR4    cfg address4          ""
+config_get ENDPOINT cfg endpoint          ""
+config_get SPLIT    cfg split_mode        "china"
+config_get MTU      cfg mtu               "1280"
+
+upexists=0
+[ -d "/sys/class/net/$IFACE" ] && upexists=1
+
+hs=0
+if [ "$upexists" = "1" ]; then
+	hs=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk -v p="$PEER" '$1==p{print $2}')
+	[ -z "$hs" ] && hs=0
+fi
+if [ "$hs" = "0" ]; then age=-1; else age=$(( $(date +%s) - hs )); fi
+
+rx=0; tx=0
+if [ "$upexists" = "1" ]; then
+	xfer=$(wg show "$IFACE" transfer 2>/dev/null | awk -v p="$PEER" '$1==p{print $2, $3}')
+	[ -n "$xfer" ] && { rx=$(echo "$xfer" | awk '{print $1}'); tx=$(echo "$xfer" | awk '{print $2}'); }
+fi
+
+routeon=0
+nft list table inet $TABLE >/dev/null 2>&1 && routeon=1
+cncount=0
+[ "$routeon" = "1" ] && cncount=$(nft list set inet $TABLE cn4 2>/dev/null | grep -oE 'elements = \{' | wc -l)
+if [ "$routeon" = "1" ]; then
+	cncount=$(nft -j list set inet $TABLE cn4 2>/dev/null | grep -o '"prefix"' | wc -l)
+	[ "$cncount" = "0" ] && cncount=$(nft list set inet $TABLE cn4 2>/dev/null | tr ',' '\n' | grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/')
+fi
+
+human_bytes() {
+	[ "$1" -ge 1048576 ] 2>/dev/null && { echo "$(awk "BEGIN{printf \"%.1f\", $1/1048576}") MiB"; return; }
+	[ "$1" -ge 1024 ] 2>/dev/null && { echo "$(awk "BEGIN{printf \"%.1f\", $1/1024}") KiB"; return; }
+	echo "${1:-0} B"
+}
+
+if [ "$1" = "--json" ]; then
+	cat <<EOF
+{"enabled":$ENABLED,"iface":"$IFACE","up":$upexists,"handshake_age":$age,
+ "rx":${rx:-0},"tx":${tx:-0},"route_on":$routeon,"split":"$SPLIT",
+ "cn_rules":$cncount,"endpoint":"$ENDPOINT","address":"$ADDR4","mtu":"$MTU"}
+EOF
+	exit 0
+fi
+
+echo "配置状态 : $([ "$ENABLED" = "1" ] && echo 已启用 || echo 未启用)"
+echo "隧道接口 : $IFACE $([ "$upexists" = "1" ] && echo '(存在)' || echo '(不存在)')"
+echo "内网地址 : ${ADDR4:-未分配}"
+echo "endpoint : ${ENDPOINT:-未设置}"
+if [ "$age" -lt 0 ]; then
+	echo "握手     : 从未成功"
+else
+	echo "握手     : $age 秒前"
+fi
+echo "流量     : 收 $(human_bytes "${rx:-0}") / 发 $(human_bytes "${tx:-0}")"
+echo "分流     : $([ "$routeon" = "1" ] && echo "已启用（$SPLIT，国内段 $cncount 条）" || echo 未启用)"

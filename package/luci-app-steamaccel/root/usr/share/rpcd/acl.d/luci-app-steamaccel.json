@@ -1,23 +1,30 @@
 {
 	"luci-app-steamaccel": {
-		"description": "Grant access to steamaccel configuration",
+		"description": "Grant access to steamaccel / warp-wg configuration",
 		"read": {
-			"uci": [ "steamaccel" ],
+			"uci": [ "steamaccel", "warp-wg" ],
 			"file": {
-				"/tmp/steamaccel/status.json": [ "read" ]
+				"/tmp/steamaccel/status.json": [ "read" ],
+				"/etc/warp-wg/account.json": [ "read" ]
 			}
 		},
 		"write": {
-			"uci": [ "steamaccel" ],
+			"uci": [ "steamaccel", "warp-wg" ],
 			"file": {
 				"/tmp/steamaccel/status.json": [ "read" ]
 			},
 			"ubus": {
-				"service": [ "reload" ]
+				"service": [ "reload", "restart" ]
 			}
 		},
 		"exec": {
-			"exec": [ "/usr/sbin/steamaccel-update" ]
+			"exec": [
+				"/usr/sbin/steamaccel-update",
+				"/usr/bin/warp-register",
+				"/usr/bin/warp-scan",
+				"/usr/bin/warp-status",
+				"/etc/init.d/warp-wg"
+			]
 		}
 	}
 }

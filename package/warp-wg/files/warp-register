@@ -1,0 +1,126 @@
+#!/bin/sh
+# warp-register —— 向 Cloudflare 注册一个免费 WARP 账号，把结果写进 UCI
+#
+# 不需要用户去官网、不需要浏览器、不需要 wgcf。路由器自己生成密钥对、
+# 自己调注册接口、自己把返回的 peer 公钥和分配到的内网地址落到配置里。
+#
+# 用法:
+#   warp-register            注册（已有配置会先备份）
+#   warp-register --force    强制重新注册
+#   warp-register --show     只看当前配置
+
+. /lib/functions.sh
+
+CFG=warp-wg
+STATE=/etc/warp-wg
+API_LIST="v0i1909051800 v0a2158 v0a1922"
+
+log() { echo "[warp] $*"; }
+die() { echo "[warp] 错误: $*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "缺少 $1，请先 opkg install wireguard-tools"; }
+
+show_current() {
+	local priv pub addr ep peer
+	config_load "$CFG"
+	config_get priv  cfg private_key  ""
+	config_get addr  cfg address4     ""
+	config_get ep    cfg endpoint     ""
+	config_get peer  cfg peer_public_key ""
+	[ -n "$priv" ] || { echo "尚未注册"; return 1; }
+	echo "内网地址 : ${addr:-未设置}"
+	echo "endpoint : ${ep:-未设置}"
+	echo "对端公钥 : ${peer:-未设置}"
+	if [ -n "$priv" ]; then
+		pub=$(echo "$priv" | wg pubkey 2>/dev/null)
+		echo "本机公钥 : ${pub:-计算失败}"
+	fi
+	return 0
+}
+
+[ "$1" = "--show" ] && { show_current; exit $?; }
+
+need wg
+need curl
+
+config_load "$CFG"
+config_get old_priv cfg private_key ""
+
+if [ -n "$old_priv" ] && [ "$1" != "--force" ]; then
+	log "已存在配置，跳过注册（用 --force 重新注册）"
+	show_current
+	exit 0
+fi
+
+# ---- 1. 生成本机密钥对 -------------------------------------------------
+PRIV=$(wg genkey) || die "wg genkey 失败"
+PUB=$(echo "$PRIV" | wg pubkey) || die "wg pubkey 失败"
+log "本机公钥: $PUB"
+
+# ---- 2. 调注册接口（多个 API 版本依次尝试） ----------------------------
+TOS=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+BODY=$(printf '{"key":"%s","install_id":"","fcm_token":"","tos":"%s","model":"PC","serial_number":"","locale":"en_US"}' \
+	"$PUB" "$TOS")
+
+RESP=""
+for api in $API_LIST; do
+	url="https://api.cloudflareclient.com/$api/reg"
+	log "尝试 $url"
+	RESP=$(curl -sS --max-time 20 \
+		-H 'Content-Type: application/json' \
+		-H 'User-Agent: okhttp/3.12.1' \
+		-X POST -d "$BODY" "$url" 2>/dev/null)
+	# 成功响应里一定有 config.peers
+	echo "$RESP" | grep -q '"peers"' && { log "注册成功（$api）"; break; }
+	log "  该端点无有效响应"
+	RESP=""
+done
+
+[ -n "$RESP" ] || die "所有注册端点均失败。可能是当前网络无法访问 Cloudflare API，
+       或 Cloudflare 已调整接口。可以手动导入：见 warp-register 文件头注释。"
+
+# ---- 3. 从 JSON 里取字段（路由器上没有 jq，用 sed 精确取） --------------
+json_str() {
+	# $1=json  $2=key  取 "key":"value" 的第一个 value
+	echo "$1" | tr -d '\n' | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+client_id=$(json_str "$RESP" client_id)
+peer_pub=$(echo "$RESP" | tr -d '\n' | sed -n 's/.*"peers"[[:space:]]*:[[:space:]]*\[[^]]*"public_key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+addr4=$(echo "$RESP" | tr -d '\n' | sed -n 's/.*"v4"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+addr6=$(echo "$RESP" | tr -d '\n' | sed -n 's/.*"v6"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+ep_host=$(echo "$RESP" | tr -d '\n' | sed -n 's/.*"host"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+device_id=$(json_str "$RESP" id)
+
+[ -n "$peer_pub" ] || die "解析不到对端公钥，响应格式可能变了。原始响应前 300 字节：
+$(echo "$RESP" | head -c 300)"
+
+log "分配地址: ${addr4:-?} ${addr6:+$addr6}"
+log "对端公钥: $peer_pub"
+log "client_id: ${client_id:-无}"
+
+# ---- 4. 写进 UCI -------------------------------------------------------
+uci -q get ${CFG}.cfg >/dev/null 2>&1 || uci set ${CFG}.cfg=warp
+uci set ${CFG}.cfg.private_key="$PRIV"
+uci set ${CFG}.cfg.peer_public_key="$peer_pub"
+uci set ${CFG}.cfg.address4="${addr4:-172.16.0.2}"
+[ -n "$addr6" ] && uci set ${CFG}.cfg.address6="$addr6"
+[ -n "$client_id" ] && uci set ${CFG}.cfg.client_id="$client_id"
+[ -n "$device_id" ] && uci set ${CFG}.cfg.device_id="$device_id"
+uci set ${CFG}.cfg.endpoint="engage.cloudflareclient.com:2408"
+uci set ${CFG}.cfg.dns="1.1.1.1"
+uci set ${CFG}.cfg.mtu="1280"
+uci set ${CFG}.cfg.enabled="1"
+uci commit "$CFG"
+
+log "配置已写入 /etc/config/warp-wg"
+cat > "$STATE/account.json" <<EOF
+{"private_key":"$PRIV","public_key":"$PUB","peer_public_key":"$peer_pub",
+ "address4":"${addr4:-172.16.0.2}","address6":"$addr6","client_id":"$client_id",
+ "device_id":"$device_id","registered_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+EOF
+chmod 600 "$STATE/account.json"
+
+log "完成。接下来："
+log "  /etc/init.d/warp-wg restart     启动隧道"
+log "  warp-scan                       优选一个能连通的 endpoint"

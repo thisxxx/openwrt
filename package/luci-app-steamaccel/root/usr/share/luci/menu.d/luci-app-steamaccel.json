@@ -3,8 +3,29 @@
 		"title": "网络加速",
 		"order": 62,
 		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-steamaccel" ]
+		}
+	},
+	"admin/services/steamaccel/overview": {
+		"title": "规则加速",
+		"order": 10,
+		"action": {
 			"type": "view",
 			"path": "steamaccel/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-steamaccel" ]
+		}
+	},
+	"admin/services/steamaccel/warp": {
+		"title": "出口（WARP）",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "steamaccel/warp"
 		},
 		"depends": {
 			"acl": [ "luci-app-steamaccel" ]

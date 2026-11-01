@@ -140,10 +140,15 @@ jobs:
           CONFIG_PACKAGE_steamaccel=y
           CONFIG_PACKAGE_easytier=y
           CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-wireguard=y
+          CONFIG_PACKAGE_wireguard-tools=y
+          CONFIG_PACKAGE_warp-wg=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_nftables=y
           EOF
           make defconfig
           echo "=== 关键开关 ==="
-          grep -E 'DEVICE_phicomm_k2p|SQUASHFS_BLOCK|PACKAGE_(steamaccel|easytier|luci-app-steamaccel|kmod-tun|dnsmasq)' .config
+          grep -E 'DEVICE_phicomm_k2p|SQUASHFS_BLOCK|PACKAGE_(steamaccel|easytier|luci-app-steamaccel|kmod-tun|warp-wg|kmod-wireguard|wireguard-tools|curl)' .config
 
       - name: 下载源码包
         run: make -j$(nproc) download V=s 2>&1 | tail -n 60

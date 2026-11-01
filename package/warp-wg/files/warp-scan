@@ -1,0 +1,91 @@
+#!/bin/sh
+# warp-scan —— endpoint 优选
+#
+# Cloudflare WARP 的边缘地址 engage.cloudflareclient.com 在国内经常连不上，
+# 但同一批边缘 IP 换端口往往就通了。这个脚本逐个试：改 endpoint → 触发握手 →
+# 看 wg 的 latest-handshake 有没有更新，第一个握手成功的就是可用出口。
+#
+# 用法:
+#   warp-scan            顺序探测，找到第一个通的就用
+#   warp-scan --all      全部探完，按握手延迟排序取最快
+#   warp-scan --timeout 3  每个候选等几秒（默认 2）
+
+CFG=warp-wg
+STATE=/etc/warp-wg
+LIST="$STATE/endpoints.txt"
+
+log() { echo "[warp-scan] $*"; }
+
+config_load "$CFG"
+config_get IFACE   cfg ifname      "warp0"
+config_get PEER    cfg peer_public_key ""
+config_get CUR_EP  cfg endpoint    ""
+
+[ -n "$PEER" ] || { echo "尚未注册，先跑 warp-register" >&2; exit 1; }
+ip link show "$IFACE" >/dev/null 2>&1 || { echo "隧道 $IFACE 未启动，先 /etc/init.d/warp-wg start" >&2; exit 1; }
+[ -s "$LIST" ] || { echo "候选列表 $LIST 为空" >&2; exit 1; }
+
+TIMEOUT=2
+ALL=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--all)     ALL=1 ;;
+		--timeout) shift; TIMEOUT="${1:-2}" ;;
+	esac
+	shift
+done
+
+handshake_age() {
+	local hs
+	hs=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk -v p="$PEER" '$1==p{print $2}')
+	[ -z "$hs" ] && { echo 999999; return; }
+	[ "$hs" = "0" ] && { echo 999999; return; }
+	echo $(( $(date +%s) - hs ))
+}
+
+try_one() {
+	local ep="$1"
+	wg set "$IFACE" peer "$PEER" endpoint "$ep" persistent-keepalive 5 2>/dev/null || return 1
+	# keepalive 会立刻发一个握手包
+	local i=0
+	while [ $i -lt $((TIMEOUT * 2)) ]; do
+		sleep 0.5
+		age=$(handshake_age)
+		[ "$age" -lt 30 ] && { echo "$age"; return 0; }
+		i=$((i+1))
+	done
+	return 1
+}
+
+BEST_EP=""
+BEST_AGE=999999
+
+TOTAL=$(grep -vcE '^\s*(#|$)' "$LIST")
+log "候选 $TOTAL 个，每个最多等 ${TIMEOUT}s"
+
+while read -r ep; do
+	case "$ep" in ''|\#*) continue ;; esac
+	echo -n "  $ep ... "
+	if age=$(try_one "$ep"); then
+		echo "通（${age}s 前握手）"
+		BEST_EP="$ep"; BEST_AGE=$age
+		[ "$ALL" = "0" ] && break
+	else
+		echo "不通"
+	fi
+done < "$LIST"
+
+if [ -z "$BEST_EP" ]; then
+	log "全部不通。可能原因："
+	log "  1. 运营商封了 WARP 的 UDP 端口（试试 endpoints.txt 里的 500 / 1701 / 4500 变体）"
+	log "  2. 当前网络对 UDP 有 QoS"
+	log "  3. 需要先用其他方式拿到可用的 WARP endpoint IP"
+	log "隧道保持原配置不变。"
+	exit 1
+fi
+
+log "选定 endpoint: $BEST_EP"
+uci set ${CFG}.cfg.endpoint="$BEST_EP"
+uci commit "$CFG"
+wg set "$IFACE" peer "$PEER" endpoint "$BEST_EP" persistent-keepalive 25
+log "已写入配置并生效"

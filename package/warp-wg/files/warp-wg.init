@@ -1,0 +1,140 @@
+#!/bin/sh /etc/rc.common
+# warp-wg —— 隧道生命周期管理
+#
+# 用 ip/wg 命令直接建接口，不走 UCI network：拆卸干净，且绝不改动系统默认路由，
+# 所以隧道挂掉时整网只是回到直连，不会断网。
+#
+# 看门狗是独立 procd 实例：握手超过 watchdog_timeout 秒没更新就就地重建，
+# 避免隧道假死时分流规则把流量送进黑洞。
+
+START=99
+STOP=10
+USE_PROCD=1
+
+CONF=warp-wg
+
+log() { echo "[warp-wg] $*"; logger -t warp-wg "$*"; }
+
+load() {
+	config_load "$CONF"
+	config_get ENABLED   cfg enabled            "0"
+	config_get IFACE     cfg ifname             "warp0"
+	config_get PRIV      cfg private_key        ""
+	config_get PEER      cfg peer_public_key    ""
+	config_get ADDR4     cfg address4           ""
+	config_get ADDR6     cfg address6           ""
+	config_get ENDPOINT  cfg endpoint           "engage.cloudflareclient.com:2408"
+	config_get MTU       cfg mtu                "1280"
+	config_get DNS       cfg dns                "1.1.1.1"
+	config_get AUTO_SCAN cfg auto_scan          "0"
+	config_get WD        cfg watchdog_timeout   "180"
+	config_get SPLIT     cfg split_mode         "china"
+}
+
+tun_up() {
+	[ -n "$PRIV" ] || { log "没有私钥，先跑 warp-register"; return 1; }
+
+	ip link del "$IFACE" 2>/dev/null
+	ip link add "$IFACE" type wireguard || { log "创建 $IFACE 失败（kmod-wireguard 未安装？）"; return 1; }
+
+	local tmp="/tmp/warp-wg.$$.conf"
+	umask 077
+	{
+		echo "[Interface]"
+		echo "PrivateKey = $PRIV"
+		echo ""
+		echo "[Peer]"
+		echo "PublicKey = $PEER"
+		echo "AllowedIPs = 0.0.0.0/0, ::/0"
+		echo "Endpoint = $ENDPOINT"
+		echo "PersistentKeepalive = 25"
+	} > "$tmp"
+	wg setconf "$IFACE" "$tmp"
+	rm -f "$tmp"
+	umask 022
+
+	[ -n "$ADDR4" ] && ip addr add "$ADDR4/32" dev "$IFACE"
+	[ -n "$ADDR6" ] && ip -6 addr add "$ADDR6/128" dev "$IFACE" 2>/dev/null
+	ip link set "$IFACE" mtu "$MTU"
+	ip link set "$IFACE" up
+
+	# 隧道内 DNS 必须走隧道，否则查询会漏到本地被污染
+	[ -n "$DNS" ] && ip route replace "$DNS/32" dev "$IFACE" 2>/dev/null
+
+	if [ "$AUTO_SCAN" = "1" ] && [ -x /usr/bin/warp-scan ]; then
+		( sleep 3; /usr/bin/warp-scan ) >/dev/null 2>&1 &
+	fi
+
+	log "隧道 $IFACE 已建立，endpoint $ENDPOINT"
+	return 0
+}
+
+tun_down() {
+	[ -x /usr/bin/warp-route ] && /usr/bin/warp-route down >/dev/null 2>&1
+	ip link del "$IFACE" 2>/dev/null
+	log "隧道已拆除"
+}
+
+watchdog_loop() {
+	load
+	local peer="$PEER" ifname="$IFACE" limit="$WD"
+	[ "$limit" -gt 0 ] 2>/dev/null || limit=180
+	log "看门狗启动（阈值 ${limit}s）"
+	while true; do
+		sleep 60
+		if [ ! -d "/sys/class/net/$ifname" ]; then
+			log "接口消失，重建"
+			load; tun_up; /usr/bin/warp-route up
+			continue
+		fi
+		local hs age
+		hs=$(wg show "$ifname" latest-handshakes 2>/dev/null | awk -v p="$peer" '$1==p{print $2}')
+		if [ -z "$hs" ] || [ "$hs" = "0" ]; then
+			age=999999
+		else
+			age=$(( $(date +%s) - hs ))
+		fi
+		if [ "$age" -gt "$limit" ]; then
+			log "握手已 $age 秒未更新，重连"
+			load
+			[ -x /usr/bin/warp-route ] && /usr/bin/warp-route down >/dev/null 2>&1
+			ip link del "$ifname" 2>/dev/null
+			sleep 2
+			tun_up
+			sleep 4
+			[ -x /usr/bin/warp-route ] && /usr/bin/warp-route up >/dev/null 2>&1
+		fi
+	done
+}
+
+start_service() {
+	load
+	if [ "$ENABLED" != "1" ]; then
+		log "未启用，跳过"
+		return 0
+	fi
+
+	if ! tun_up; then
+		log "隧道建立失败，服务不启动"
+		return 1
+	fi
+	[ -x /usr/bin/warp-route ] && /usr/bin/warp-route up
+
+	procd_open_instance watchdog
+	procd_set_param command /bin/sh /etc/init.d/warp-wg watchdog_run
+	procd_set_param respawn 3600 5 3
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	load
+	[ -x /usr/bin/warp-route ] && /usr/bin/warp-route down >/dev/null 2>&1
+	ip link del "$IFACE" 2>/dev/null
+	log "已停止"
+}
+
+case "$1" in
+	watchdog_run) watchdog_loop ;;
+esac
