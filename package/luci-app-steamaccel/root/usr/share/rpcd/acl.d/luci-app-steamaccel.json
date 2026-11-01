@@ -1,0 +1,23 @@
+{
+	"luci-app-steamaccel": {
+		"description": "Grant access to steamaccel configuration",
+		"read": {
+			"uci": [ "steamaccel" ],
+			"file": {
+				"/tmp/steamaccel/status.json": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "steamaccel" ],
+			"file": {
+				"/tmp/steamaccel/status.json": [ "read" ]
+			},
+			"ubus": {
+				"service": [ "reload" ]
+			}
+		},
+		"exec": {
+			"exec": [ "/usr/sbin/steamaccel-update" ]
+		}
+	}
+}

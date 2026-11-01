@@ -1,0 +1,9 @@
+#!/bin/sh
+#
+# WAN 起来（或重连）后重新渲染一次规则。
+# 不在这里做网络更新，避免每次拨号都去打官方接口；更新交给 cron。
+#
+[ "$ACTION" = "ifup" ] || exit 0
+[ "$INTERFACE" = "wan" ] || exit 0
+
+/usr/sbin/steamaccel-apply >/dev/null 2>&1 &

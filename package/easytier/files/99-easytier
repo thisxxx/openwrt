@@ -1,0 +1,14 @@
+#!/bin/sh
+#
+# 首次启动时确保 TUN 设备与权限就位
+#
+[ -e /dev/net/tun ] || {
+	mkdir -p /dev/net
+	mknod /dev/net/tun c 10 200 2>/dev/null
+	chmod 600 /dev/net/tun
+}
+
+# 关掉后面这些默认服务，K2P 16MB flash 上跑不合算
+/etc/init.d/easytier disable 2>/dev/null
+
+exit 0

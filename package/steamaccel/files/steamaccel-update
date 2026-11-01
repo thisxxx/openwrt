@@ -1,0 +1,109 @@
+#!/bin/sh
+#
+# steamaccel-update —— 从官方接口拉取加速规则
+#
+# 接口: POST https://api.steampp.net/accelerator/projectgroups  Content-Type: application/json
+#       无鉴权，返回 28KB 左右 JSON。响应无 ETag / Cache-Control，每次都是全量。
+#
+# 三重退路（任一成功即止）:
+#   1. uclient-fetch --post-data + --header
+#   2. uclient-fetch --method POST + --header + 从 stdin 喂 body
+#   3. 用户自建镜像（UCI 里填 mirror，GET 方式）
+#
+# 全部失败时保留固件内已有规则，不清空、不让网络变砖。
+#
+. /lib/functions.sh
+
+API_DEFAULT="https://api.steampp.net/accelerator/projectgroups"
+RULES_DIR="/etc/steamaccel"
+RULES="$RULES_DIR/rules.json"
+TMP="/tmp/steamaccel"
+LOCK="/var/lock/steamaccel-update.lock"
+
+log() { logger -t steamaccel "$*"; }
+
+[ "$1" = "--force" ] && FORCE=1
+
+config_load steamaccel
+config_get enabled main enabled 1
+config_get api main api "$API_DEFAULT"
+config_get mirror main mirror ""
+
+[ "$enabled" = "1" ] || { log "disabled, skip update"; exit 0; }
+[ "$FORCE" = "1" ] || [ "$1" = "boot" ] || true
+
+mkdir -p "$TMP" "$RULES_DIR"
+
+# 简单互斥，避免 procd 定时和手动同时跑
+if [ -f "$LOCK" ]; then
+	pid=$(cat "$LOCK" 2>/dev/null)
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		log "another update running (pid $pid), skip"
+		exit 0
+	fi
+fi
+echo $$ > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT INT TERM
+
+NEW="$TMP/rules.new"
+
+# 校验拉下来的东西像不像规则包
+is_valid() {
+	[ -s "$1" ] || return 1
+	sz=$(wc -c < "$1")
+	[ "$sz" -gt 2000 ] || return 1
+	# 必须能解析出规则树的 key（🦓 = f0 9f a6 93）
+	grep -q 'MatchDomainNames' "$1" || return 1
+	return 0
+}
+
+try_post() {
+	uclient-fetch -q -T 25 -O "$NEW" \
+		--header 'Content-Type: application/json' \
+		--header 'Accept: application/json' \
+		--post-data '{}' "$api" 2>/dev/null
+}
+
+try_method_post() {
+	printf '{}' > "$TMP/body.json"
+	uclient-fetch -q -T 25 -O "$NEW" \
+		--header 'Content-Type: application/json' \
+		--method POST --post-data '{}' "$api" 2>/dev/null
+}
+
+try_mirror() {
+	[ -n "$mirror" ] || return 1
+	uclient-fetch -q -T 25 -O "$NEW" "$mirror" 2>/dev/null
+}
+
+got=0
+for fn in try_post try_method_post try_mirror; do
+	rm -f "$NEW"
+	if $fn && is_valid "$NEW"; then
+		got=1
+		log "fetched via $fn ($(wc -c < "$NEW") bytes)"
+		break
+	fi
+done
+
+if [ "$got" != "1" ]; then
+	log "fetch failed (api=$api), keeping existing rules"
+	exit 1
+fi
+
+# 内容没变就不折腾 dnsmasq
+if [ -f "$RULES" ] && cmp -s "$NEW" "$RULES"; then
+	log "rules unchanged"
+	rm -f "$NEW"
+	exec /usr/sbin/steamaccel-apply
+fi
+
+cp "$NEW" "$RULES.tmp" && mv "$RULES.tmp" "$RULES" || {
+	log "cannot write $RULES"
+	exit 1
+}
+rm -f "$NEW"
+chmod 644 "$RULES"
+date +%s > "$TMP/last_update"
+
+/usr/sbin/steamaccel-apply

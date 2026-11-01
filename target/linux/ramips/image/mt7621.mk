@@ -2010,7 +2010,8 @@ define Device/phicomm_k2p
   DEVICE_ALT0_VENDOR := Phicomm
   DEVICE_ALT0_MODEL := KE 2P
   SUPPORTED_DEVICES += k2p
-  DEVICE_PACKAGES := kmod-mt7615-firmware -uboot-envtools
+  DEVICE_PACKAGES := kmod-mt7615-firmware -uboot-envtools \
+	kmod-tun steamaccel luci-app-steamaccel easytier
 endef
 TARGET_DEVICES += phicomm_k2p
 

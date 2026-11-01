@@ -1,0 +1,115 @@
+#!/bin/sh
+#
+# steamaccel-apply —— 把规则渲染成 dnsmasq 配置并热加载
+#
+# 流程:
+#   rules.json --gen.lua--> 完整 dnsmasq 片段
+#                          --probe 探活--> 剔掉连不通的 IP
+#                          --> /tmp/dnsmasq.d/steamaccel.conf --> reload dnsmasq
+#
+# 设计原则: 宁慢不死。某个上游 IP 挂了就退回正常 DNS 解析，绝不写死一条死路。
+#
+. /lib/functions.sh
+
+RULES_DIR="/etc/steamaccel"
+RULES="$RULES_DIR/rules.json"
+TMP="/tmp/steamaccel"
+OUT="/tmp/dnsmasq.d/steamaccel.conf"
+NGX_OUT="/tmp/steamaccel/nginx-upstreams.conf"
+
+log() { logger -t steamaccel "$*"; }
+
+[ "$1" = "--no-healthcheck" ] && HC=0 || HC=1
+
+config_load steamaccel
+config_get enabled main enabled 1
+config_get use_healthcheck main healthcheck 1
+config_get probe_timeout main probe_timeout 2000
+config_get sni_enabled main sni 0
+
+[ "$enabled" = "1" ] || {
+	rm -f "$OUT"
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1
+	exit 0
+}
+
+[ "$use_healthcheck" = "1" ] || HC=0
+
+mkdir -p "$TMP" /tmp/dnsmasq.d
+
+SRC="$RULES"
+[ -s "$SRC" ] || SRC="/usr/share/steamaccel/rules.json"
+if [ ! -s "$SRC" ]; then
+	log "no rules available"
+	exit 1
+fi
+
+# ---------- 1. 渲染 ----------
+FULL="$TMP/dnsmasq.full"
+lua /usr/lib/steamaccel/gen.lua "$SRC" --mode dnsmasq > "$FULL" 2>"$TMP/gen.err"
+if [ $? -ne 0 ] || [ ! -s "$FULL" ]; then
+	log "gen.lua failed: $(cat "$TMP/gen.err" 2>/dev/null)"
+	exit 1
+fi
+
+# ---------- 2. 探活写死 IP 的那些 ----------
+DEAD="$TMP/dead.txt"
+: > "$DEAD"
+if [ "$HC" = "1" ] && command -v steamaccel-probe >/dev/null 2>&1; then
+	# address=/domain/1.2.3.4 里抽出所有 IP
+	sed -n 's|^address=/[^/]*/\([0-9][0-9.]*\)$|\1|p' "$FULL" | sort -u > "$TMP/ips.txt"
+	if [ -s "$TMP/ips.txt" ]; then
+		timeout 25 steamaccel-probe -p 443 -t "$probe_timeout" -c 32 -r 2 \
+			< "$TMP/ips.txt" 2>/dev/null | awk '$3=="timeout"{print $4}' > "$DEAD"
+	fi
+fi
+
+# ---------- 3. 落地 ----------
+{
+	echo "# steamaccel $(date '+%Y-%m-%d %H:%M:%S')"
+	echo "# source: $SRC"
+	if [ -s "$DEAD" ]; then
+		echo "# $(wc -l < "$DEAD") upstream ip(s) unreachable, fell back to normal DNS"
+	fi
+	grep -v '^#' "$FULL" | while IFS= read -r line; do
+		case "$line" in
+		address=*)
+			ip=$(echo "$line" | sed -n 's|^address=/[^/]*/\([0-9][0-9.]*\)$|\1|p')
+			if [ -n "$ip" ] && [ -s "$DEAD" ] && grep -qxF "$ip" "$DEAD"; then
+				continue
+			fi
+			;;
+		esac
+		echo "$line"
+	done
+} > "$OUT.tmp"
+
+mv "$OUT.tmp" "$OUT"
+chmod 644 "$OUT"
+
+# ---------- 4. SNI 分流（可选，需要 nginx） ----------
+if [ "$sni_enabled" = "1" ] && command -v nginx >/dev/null 2>&1; then
+	lua /usr/lib/steamaccel/gen.lua "$SRC" --mode nginx > "$NGX_OUT" 2>/dev/null
+	if [ -s "$NGX_OUT" ]; then
+		cp "$NGX_OUT" /etc/nginx/steamaccel-map.conf 2>/dev/null
+		nginx -s reload 2>/dev/null || /etc/init.d/nginx restart >/dev/null 2>&1
+		log "nginx sni map applied"
+	fi
+fi
+
+/etc/init.d/dnsmasq reload >/dev/null 2>&1
+
+# ---------- 5. 状态，给 LuCI 读 ----------
+total=$(grep -c '^\(address\|cname\)=' "$OUT" 2>/dev/null)
+ncname=$(grep -c '^cname=' "$OUT" 2>/dev/null)
+naddr=$(grep -c '^address=' "$OUT" 2>/dev/null)
+ndead=$( [ -s "$DEAD" ] && wc -l < "$DEAD" || echo 0 )
+updated=$(cat "$TMP/last_update" 2>/dev/null || echo 0)
+[ "$updated" = "0" ] && updated=$(stat -c %Y "$SRC" 2>/dev/null || echo 0)
+
+cat > "$TMP/status.json" <<EOF
+{"total":${total:-0},"cname":${ncname:-0},"address":${naddr:-0},"dead":${ndead:-0},"updated":${updated:-0},"source":"$(basename "$SRC")"}
+EOF
+
+log "applied: total=$total cname=$ncname address=$naddr dead=$ndead"
+exit 0

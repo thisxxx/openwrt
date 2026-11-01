@@ -1,0 +1,225 @@
+name: Build K2P OpenWrt (steamaccel + easytier)
+
+# 目标设备: 斐讯 K2P A1/A2 (MT7621A + MT7615D / 16MB NOR / 128MB RAM / 1x USB2.0)
+# 基础:   openwrt/openwrt v23.05.6
+# 分区:   firmware 0xa0000 + 0xf60000 = 15.375 MiB = 16,121,856 B
+#         (mt7621.mk 里 IMAGE_SIZE := 15744k，两者一致)
+#
+# 与上一个 Padavan 方案的区别: 不带 mihomo。加速走「DNS 改写 + 探活选优」，
+# 不做 TLS 中间人，客户端零证书。
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_release:
+        description: '同时创建 Release'
+        type: boolean
+        default: true
+  push:
+    branches: [ k2p-accel ]
+    paths:
+      - 'package/steamaccel/**'
+      - 'package/easytier/**'
+      - 'package/luci-app-steamaccel/**'
+      - 'target/linux/ramips/image/mt7621.mk'
+      - '.github/workflows/build-k2p.yml'
+
+permissions:
+  contents: write
+
+env:
+  TARGET_PROFILE: phicomm_k2p
+  IMAGE_LIMIT: 16121856        # IMAGE_SIZE 15744k
+  SAFE_LIMIT: 16000000         # 自限，留 120KB 余量
+  EASYTIER_SIZE: 6698364
+  SQUASHFS_BLOCK: 512
+
+jobs:
+  build:
+    name: build K2P firmware
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -a -f || true
+          df -h /
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ccache ecj fastjar file g++ gawk gettext git \
+            libelf-dev libncurses5-dev libncursesw5-dev libssl-dev \
+            python3 python3-distutils python3-setuptools rsync unzip wget \
+            zlib1g-dev bzip2 autoconf automake libtool-bin pkg-config \
+            subversion flex bison lib32gcc-s1 libc6-dev-i386 lib32stdc++6 \
+            gcc-multilib xmlto squashfs-tools time upx-ucl
+          ccache --version | head -1
+
+      # ---------------------------------------------------------------- 前置校验
+      - name: 校验包与二进制
+        run: |
+          set -e
+          echo "::group::easytier-core"
+          f=package/easytier/files/easytier-core
+          [ -f "$f" ] || { echo "缺少 $f"; exit 1; }
+          sz=$(wc -c < "$f")
+          echo "size = $sz"
+          if [ "$sz" = "1769144" ]; then echo "这是 UPX 压缩版，必须先去壳"; exit 1; fi
+          if [ "$sz" != "$EASYTIER_SIZE" ]; then echo "大小不符: 期望 $EASYTIER_SIZE"; exit 1; fi
+          md5sum "$f"
+          # ELF32 / MIPS / 小端 / EXEC
+          magic=$(od -An -tx1 -N 20 "$f" | tr -d ' \n')
+          echo "elf head = $magic"
+          case "$magic" in
+            7f454c4601010100*02000800*) echo "ELF32 MIPS LE 静态 OK" ;;
+            *) echo "ELF 头不符"; exit 1 ;;
+          esac
+          # 静态链接检查：不能引用动态加载器
+          if strings -a "$f" | grep -qE '/lib/ld-(musl|uClibc|so)'; then
+            echo "检测到动态加载器引用，不是静态二进制"; exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::规则包"
+          r=package/steamaccel/files/rules.json
+          [ -s "$r" ] || { echo "缺少内置规则 $r"; exit 1; }
+          python3 -c "
+          import json,sys
+          d=json.load(open('$r',encoding='utf-8'))
+          assert '🦓' in d, 'no rule tree'
+          n=sum(len(g.get('Items') or []) for g in d['🦓'])
+          print(f'规则组 {len(d[\"🦓\"])}, 一级条目 {n}')
+          "
+          echo "::endgroup::"
+
+          echo "::group::设备定义"
+          grep -q 'steamaccel luci-app-steamaccel easytier' target/linux/ramips/image/mt7621.mk \
+            || { echo "mt7621.mk 里没挂上包"; exit 1; }
+          echo "::endgroup::"
+
+      # ---------------------------------------------------------------- feeds
+      - name: 配置 feeds（走 GitHub 镜像）
+        run: |
+          set -e
+          cp feeds.conf.default feeds.conf
+          # git.openwrt.org 在部分网络下不稳，换 GitHub 镜像；commit 号保留不动
+          sed -i 's|https://git.openwrt.org/feed/packages.git|https://github.com/openwrt/packages.git|' feeds.conf
+          sed -i 's|https://git.openwrt.org/project/luci.git|https://github.com/openwrt/luci.git|' feeds.conf
+          sed -i 's|https://git.openwrt.org/feed/routing.git|https://github.com/openwrt/routing.git|' feeds.conf
+          sed -i 's|https://git.openwrt.org/feed/telephony.git|https://github.com/openwrt/telephony.git|' feeds.conf
+          cat feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # ---------------------------------------------------------------- 配置
+      - name: 生成 .config
+        run: |
+          set -e
+          cat > .config <<'EOF'
+          CONFIG_TARGET_ramips=y
+          CONFIG_TARGET_ramips_mt7621=y
+          CONFIG_TARGET_ramips_mt7621_DEVICE_phicomm_k2p=y
+          CONFIG_TARGET_MULTI_PROFILE=n
+          # 512K 块: Rust/Go 这类静态大二进制跨块才有冗余，256K 块会吃掉一截压缩率
+          CONFIG_TARGET_SQUASHFS_BLOCK_SIZE=512
+          CONFIG_CCACHE=y
+          CONFIG_DEVEL=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-ssl=y
+          CONFIG_PACKAGE_luci-app-steamaccel=y
+          CONFIG_PACKAGE_steamaccel=y
+          CONFIG_PACKAGE_easytier=y
+          CONFIG_PACKAGE_kmod-tun=y
+          EOF
+          make defconfig
+          echo "=== 关键开关 ==="
+          grep -E 'DEVICE_phicomm_k2p|SQUASHFS_BLOCK|PACKAGE_(steamaccel|easytier|luci-app-steamaccel|kmod-tun|dnsmasq)' .config
+
+      - name: 下载源码包
+        run: make -j$(nproc) download V=s 2>&1 | tail -n 60
+
+      - name: 编译
+        run: |
+          set -o pipefail
+          make -j$(nproc) V=s 2>&1 | tee build.log | tail -n 200
+
+      # ---------------------------------------------------------------- 产物校验
+      - name: 产物校验
+        run: |
+          set -e
+          img=$(ls -1 bin/targets/ramips/mt7621/*phicomm_k2p*squashfs-sysupgrade.bin | head -1)
+          [ -n "$img" ] || { echo "没有产物"; exit 1; }
+          sz=$(wc -c < "$img")
+
+          mib=$(python3 -c "print(f'{$sz/1048576:.2f}')")
+          margin=$(python3 -c "print(f'{($IMAGE_LIMIT-$sz)/1048576:.2f}')")
+
+          echo "image = $img"
+          echo "size  = $sz bytes = $mib MiB"
+          echo "limit = $IMAGE_LIMIT (15.375 MiB)"
+          echo "余量  = $margin MiB"
+
+          if [ "$sz" -gt "$SAFE_LIMIT" ]; then
+            echo "::error::超出自限 $SAFE_LIMIT 字节"
+            exit 1
+          fi
+
+          echo "::group::squashfs 内容抽查"
+          unsquashfs -ls "$img" 2>/dev/null | grep -E 'usr/bin/(easytier-core|steamaccel-probe|steamaccel-update|steamaccel-apply)|etc/init\.d/(steamaccel|easytier)|usr/lib/steamaccel/gen\.lua|usr/share/steamaccel/rules\.json|view/steamaccel' \
+            || { echo "::error::关键文件没进 squashfs"; exit 1; }
+          echo "::endgroup::"
+
+          echo "::group::easytier-core 字节数（必须等于源文件）"
+          unsquashfs -ll "$img" 2>/dev/null | grep 'usr/bin/easytier-core' | head -2
+          echo "::endgroup::"
+
+          echo "::group::体积明细"
+          ls -la bin/targets/ramips/mt7621/ | grep -E 'squashfs|initramfs'
+          echo "::endgroup::"
+
+          {
+            echo "# K2P 体积报告"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 镜像 | \`$(basename "$img")\` |"
+            echo "| 字节 | $sz |"
+            echo "| MiB | $mib |"
+            echo "| 分区上限 | $IMAGE_LIMIT |"
+            echo "| 余量 | $margin MiB |"
+          } > size-report.md
+          cat size-report.md
+
+      # ---------------------------------------------------------------- 上传
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: K2P-openwrt-${{ github.sha }}
+          path: |
+            bin/targets/ramips/mt7621/*phicomm_k2p*squashfs-sysupgrade.bin
+            bin/targets/ramips/mt7621/*phicomm_k2p*initramfs-kernel.bin
+            size-report.md
+          retention-days: 30
+
+      - name: 创建 Release
+        if: inputs.upload_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          tag="k2p-owrt-$(date +%Y%m%d)-${GITHUB_SHA::7}"
+          gh release create "$tag" \
+            bin/targets/ramips/mt7621/*phicomm_k2p*squashfs-sysupgrade.bin \
+            size-report.md \
+            --title "K2P OpenWrt 23.05.6 + steamaccel + easytier ($tag)" \
+            --notes-file size-report.md || true

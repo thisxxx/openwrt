@@ -1,0 +1,52 @@
+#!/bin/sh /etc/rc.common
+#
+# steamaccel 服务
+#
+# 开机: 渲染规则 + 热加载 dnsmasq
+# 常驻: 不驻留进程，用 cron 定时更新（128MB RAM 的机器上省一点是省一点）
+#
+START=95
+STOP=10
+
+USE_PROCD=1
+
+. /lib/functions.sh
+
+CRON_TAG="# steamaccel-managed"
+
+install_cron() {
+	local interval
+	config_load steamaccel
+	config_get interval main update_interval 24
+	[ -n "$interval" ] || interval=24
+
+	# 先清掉自己以前写的，保证幂等
+	sed -i "/$CRON_TAG/d" /etc/crontabs/root 2>/dev/null
+	echo "0 4 */1 * * /usr/sbin/steamaccel-update $CRON_TAG" >> /etc/crontabs/root
+	/etc/init.d/cron reload >/dev/null 2>&1 || /etc/init.d/cron restart >/dev/null 2>&1
+}
+
+remove_cron() {
+	sed -i "/$CRON_TAG/d" /etc/crontabs/root 2>/dev/null
+	/etc/init.d/cron reload >/dev/null 2>&1
+}
+
+start_service() {
+	# 首次启动：如果还没有 rules.json，先试一次网络更新（失败就用固件内烘焙的）
+	[ -s /etc/steamaccel/rules.json ] || /usr/sbin/steamaccel-update boot >/dev/null 2>&1
+	/usr/sbin/steamaccel-apply >/dev/null 2>&1
+	install_cron
+	logger -t steamaccel "started"
+}
+
+stop_service() {
+	remove_cron
+	rm -f /tmp/dnsmasq.d/steamaccel.conf
+	rm -f /etc/nginx/steamaccel-map.conf
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1
+	logger -t steamaccel "stopped"
+}
+
+reload_service() {
+	/usr/sbin/steamaccel-apply
+}
