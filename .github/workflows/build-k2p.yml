@@ -210,6 +210,21 @@ jobs:
           echo "limit = $IMAGE_LIMIT (15.375 MiB)"
           echo "余量  = $margin MiB"
 
+          # 报告先落盘再做内容校验：校验挂了也得把它带进 artifact，否则排查时没数
+          {
+            echo "# K2P 体积报告"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 镜像 | \`$(basename "$img")\` |"
+            echo "| 字节 | $sz |"
+            echo "| MiB | $mib |"
+            echo "| 分区上限 | $IMAGE_LIMIT (15.375 MiB) |"
+            echo "| 自限 | $SAFE_LIMIT |"
+            echo "| 余量 | $margin MiB |"
+          } > size-report.md
+          cat size-report.md
+
           if [ "$sz" -gt "$SAFE_LIMIT" ]; then
             echo "::error::超出自限 $SAFE_LIMIT 字节"
             exit 1
@@ -257,11 +272,33 @@ jobs:
             if grep -q "$p" sq.txt; then echo "OK   $p"; else echo "MISS $p"; miss=$((miss+1)); fi
           done
 
-          # easytier-core 与源文件必须字节一致，防止被 strip / upx 二次处理
+          # OpenWrt 打包阶段会对 /usr/bin 下的可执行文件跑 $(TARGET_CROSS)strip，
+          # 符号表被剥掉，体积只会小幅变小（实测 -1313 B / 0.02%）。所以判据不是
+          # 字节相等，而是「不许变大、不许缩超过 3%」，再抠出来验 ELF 头。
           got=$(unsquashfs -o "$off" -ll "$img" 2>/dev/null | awk '/usr\/bin\/easytier-core$/ {print $3; exit}')
-          echo "镜像内 easytier-core = ${got:-未取到} (源 $EASYTIER_SIZE)"
-          if [ -n "$got" ] && [ "$got" != "$EASYTIER_SIZE" ]; then
-            echo "::error::easytier-core 字节数不符"; exit 1
+          echo "镜像内 easytier-core = ${got:-未取到} (源 $EASYTIER_SIZE，strip 后应略小)"
+          [ -n "$got" ] || { echo "::error::没读到 easytier-core 大小"; exit 1; }
+          lower=$((EASYTIER_SIZE * 97 / 100))
+          if [ "$got" -gt "$EASYTIER_SIZE" ] || [ "$got" -lt "$lower" ]; then
+            echo "::error::easytier-core 体积异常：$got 不在 $lower..$EASYTIER_SIZE 内"
+            exit 1
+          fi
+          echo "OK   体积在 strip 合理区间 ($(( (EASYTIER_SIZE-got) )) 字节被剥)"
+
+          unsquashfs -o "$off" -cat "$img" usr/bin/easytier-core > et.bin 2>/dev/null || true
+          if [ -s et.bin ]; then
+            magic=$(od -An -tx1 -N4 et.bin | tr -d ' \n')
+            cls=$(od -An -tu1 -j4  -N1 et.bin | tr -d ' \n')
+            end=$(od -An -tu1 -j5  -N1 et.bin | tr -d ' \n')
+            mach=$(od -An -tu2 -j18 -N2 et.bin | tr -d ' \n')
+            echo "ELF: magic=$magic class=$cls endian=$end e_machine=$mach"
+            [ "$magic" = "7f454c46" ] || { echo "::error::不是 ELF"; exit 1; }
+            [ "$cls" = "1" ] || { echo "::error::不是 ELF32"; exit 1; }
+            [ "$end" = "1" ] || { echo "::error::不是小端"; exit 1; }
+            [ "$mach" = "8" ] || { echo "::error::e_machine=$mach，不是 MIPS(8)"; exit 1; }
+            echo "OK   ELF 头：ELF32 / 小端 / MIPS"
+          else
+            echo "::warning::没抠出 easytier-core，跳过 ELF 头校验"
           fi
 
           [ "$miss" -eq 0 ] || { echo "::error::$miss 个关键文件没进镜像"; exit 1; }
@@ -270,19 +307,6 @@ jobs:
           echo "::group::体积明细"
           ls -la bin/targets/ramips/mt7621/ | grep -E 'squashfs|initramfs'
           echo "::endgroup::"
-
-          {
-            echo "# K2P 体积报告"
-            echo ""
-            echo "| 项 | 值 |"
-            echo "|---|---|"
-            echo "| 镜像 | \`$(basename "$img")\` |"
-            echo "| 字节 | $sz |"
-            echo "| MiB | $mib |"
-            echo "| 分区上限 | $IMAGE_LIMIT |"
-            echo "| 余量 | $margin MiB |"
-          } > size-report.md
-          cat size-report.md
 
       # ---------------------------------------------------------------- 上传
       - name: 上传 artifact
