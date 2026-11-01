@@ -5,6 +5,9 @@
 			"uci": [ "steamaccel", "warp-wg" ],
 			"file": {
 				"/tmp/steamaccel/status.json": [ "read" ],
+				"/etc/steamaccel/extra.tsv": [ "read" ],
+				"/etc/steamaccel/generic-ips.txt": [ "read" ],
+				"/etc/steamaccel/gh-mirrors.txt": [ "read" ],
 				"/etc/warp-wg/account.json": [ "read" ]
 			}
 		},
@@ -20,10 +23,13 @@
 		"exec": {
 			"exec": [
 				"/usr/sbin/steamaccel-update",
+				"/usr/sbin/steamaccel-sync",
+				"/usr/sbin/steamaccel-apply",
 				"/usr/bin/warp-register",
 				"/usr/bin/warp-scan",
 				"/usr/bin/warp-status",
-				"/etc/init.d/warp-wg"
+				"/etc/init.d/warp-wg",
+				"/etc/init.d/steamaccel"
 			]
 		}
 	}

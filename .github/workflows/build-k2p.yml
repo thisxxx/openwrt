@@ -102,6 +102,42 @@ jobs:
           "
           echo "::endgroup::"
 
+          echo "::group::同步通道快照"
+          e=package/steamaccel/files/extra.tsv
+          [ -s "$e" ] || { echo "缺少内置通道快照 $e"; exit 1; }
+          awk -F'\t' 'NF<3 || $1 !~ /\./ { bad++ } END { if (bad) { print "格式错误行:", bad; exit 1 } }' "$e"
+          echo "条目 $(wc -l < "$e"), 域名 $(cut -f1 "$e" | sort -u | wc -l), 上游 $(cut -f2 "$e" | sort -u | wc -l)"
+          # 账号/支付类域名绝不能指向第三方反代
+          if cut -f1 "$e" | grep -E '^(accounts?|login|signin|auth|oauth|pay|payment|checkout|billing|wallet|password|mail|email|sms)\.' \
+             || cut -f1 "$e" | grep -E '\.(accounts?|login|signin|auth|oauth|pay|payment|checkout|billing|wallet)\.'; then
+            echo "通道表里混入了账号/支付类域名，必须剔除"; exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::脚本语法"
+          for s in package/steamaccel/files/steamaccel-{update,apply,sync} \
+                   package/steamaccel/files/steamaccel.init \
+                   package/steamaccel/files/90-steamaccel \
+                   package/easytier/files/easytier.init \
+                   package/warp-wg/files/warp-{register,scan,route,status} \
+                   package/warp-wg/files/warp-wg.init; do
+            [ -f "$s" ] || { echo "缺少 $s"; exit 1; }
+            sh -n "$s" || { echo "shell 语法错误: $s"; exit 1; }
+          done
+          # gen.lua 只在运行时被执行，编译期不碰 —— 语法错了要等刷机才发现，
+          # 所以在这里先过一遍。runner 上的 lua 未必叫 lua，逐个试。
+          LUA=""
+          for c in lua lua5.1 lua5.3 lua5.4 luajit; do
+            command -v "$c" >/dev/null 2>&1 && { LUA="$c"; break; }
+          done
+          if [ -n "$LUA" ]; then
+            "$LUA" -e 'assert(loadfile("package/steamaccel/files/gen.lua"))' \
+              && echo "gen.lua 语法 OK ($LUA)" || { echo "gen.lua 语法错误"; exit 1; }
+          else
+            echo "runner 上没有 lua，跳过 gen.lua 语法检查"
+          fi
+          echo "::endgroup::"
+
           echo "::group::设备定义"
           grep -q 'steamaccel luci-app-steamaccel easytier' target/linux/ramips/image/mt7621.mk \
             || { echo "mt7621.mk 里没挂上包"; exit 1; }

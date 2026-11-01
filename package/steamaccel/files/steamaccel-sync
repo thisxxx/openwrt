@@ -1,0 +1,284 @@
+#!/bin/sh
+#
+# steamaccel-sync —— 同步第三方加速器的通道，产出 extra.tsv
+#
+# 为什么单独一个脚本：
+#   Watt 的接口只给官方认可的公益反代，覆盖不到 UsbEAm / 302 这些老牌工具
+#   各自维护的节点。这些节点在"官方规则失效"时往往还活着，是重要的备用通道。
+#
+# 产出的 extra.tsv 会被 gen.lua 读入，且**排在 Watt 规则之前**（先访问），
+# 因为它们更新更勤、更贴近当下的可用性。
+#
+# 格式: domain <TAB> ip <TAB> source       每行一条，同域多 IP 多行
+#
+# 源（全部无鉴权，GET 即可）：
+#   usbeam     dogfight360/UsbEAm/usbeam_new_20.xml
+#              540 条规则，[Reverse proxy] 段的 IPLIST 是 4 个通用 SNI 反代 IP
+#   steam302   YoseR1cho/steamcommunity_302_V12.0.4/steamcommunity_302.caddy.json
+#              闭源工具，但发布的 Caddyfile 是明文，能读出 14 个上游
+#   ghproxy    weekoo2025/ghproxy/mirrors.json
+#              GitHub / Docker 镜像前缀（URL 反代，不进 DNS，只写列表给固件自己用）
+#
+# 网络前提：raw.githubusercontent.com 在大陆直连不通，默认走 gh-proxy.com 前缀。
+# 前缀是镜像，实测大陆能通；全失败时退回直连（隧道起来后就能过）。
+#
+. /lib/functions.sh
+
+RULES_DIR="/etc/steamaccel"
+OUT="$RULES_DIR/extra.tsv"
+TMP="/tmp/steamaccel"
+LOG_TAG="steamaccel"
+UA="WattRouter/1.0 (OpenWrt; steamaccel)"
+LOCK="/var/lock/steamaccel-sync.lock"
+
+log() { logger -t "$LOG_TAG" "sync: $*"; }
+
+config_load steamaccel
+config_get enabled main enabled 1
+config_get sync_usbeam main sync_usbeam 1
+config_get sync_302 main sync_302 1
+config_get sync_ghproxy main sync_ghproxy 1
+
+[ "$enabled" = "1" ] || { log "disabled"; exit 0; }
+
+mkdir -p "$TMP" "$RULES_DIR"
+
+if [ -f "$LOCK" ]; then
+	pid=$(cat "$LOCK" 2>/dev/null)
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		log "another sync running (pid $pid)"
+		exit 0
+	fi
+fi
+echo $$ > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT INT TERM
+
+# ---------- 取文件：curl 优先，退回 uclient-fetch / wget ----------
+fetch() {
+	# $1 = url, $2 = outfile
+	rm -f "$2"
+	if command -v curl >/dev/null 2>&1; then
+		curl -sfL --connect-timeout 10 -m 45 -A "$UA" -o "$2" "$1" 2>/dev/null \
+			&& [ -s "$2" ] && return 0
+	fi
+	if command -v uclient-fetch >/dev/null 2>&1; then
+		uclient-fetch -q -T 45 -O "$2" "$1" 2>/dev/null \
+			&& [ -s "$2" ] && return 0
+	fi
+	if command -v wget >/dev/null 2>&1; then
+		wget -q -T 45 -O "$2" --header="User-Agent: $UA" "$1" 2>/dev/null \
+			&& [ -s "$2" ] && return 0
+	fi
+	return 1
+}
+
+# raw.github 在大陆直连不通，走镜像前缀；不通再直连
+fetch_gh() {
+	# $1 = repo 内路径（如 dogfight360/UsbEAm/master/Usbeam/usbeam_new_20.xml）
+	# $2 = 落地文件
+	local raw="https://raw.githubusercontent.com/$1"
+	for pfx in "https://gh-proxy.com/" "https://mirror.houlang.cloud/" ""; do
+		fetch "${pfx}${raw}" "$2" && return 0
+		log "  miss: ${pfx:-direct}$1"
+	done
+	return 1
+}
+
+WORK="$TMP/sync"
+mkdir -p "$WORK"
+: > "$WORK/all.tsv"
+
+# ---------- 1. UsbEAm ----------
+# 格式（管道分隔，字段数随版本浮动，端口在最后）：
+#   45001=英文名|中文名|该条IP(可空)|域名列表(逗号分隔)|英文说明|中文说明|端口
+# 段首的 IPLIST= 是该组的公共 IP 池，条目自己没写 IP 时用它。
+sync_usbeam() {
+	local f="$WORK/usbeam.xml"
+
+	fetch_gh "dogfight360/UsbEAm/master/Usbeam/usbeam_new_20.xml" "$f" || {
+		log "usbeam: fetch failed"
+		return 1
+	}
+	grep -q '^\[usbeam\]' "$f" || { log "usbeam: not a valid file"; return 1; }
+
+	awk -F'|' '
+	function trim(s) { gsub(/^[ \t\r]+|[ \t\r]+$/, "", s); return s }
+	/^\[/ { sec = $0; next }
+	sec != "[Reverse proxy]" && sec != "[Reverse proxy(platform)]" { next }
+	/^IPLIST=/ {
+		sub(/^IPLIST=/, "")
+		pool[sec] = trim($0)
+		next
+	}
+	/^[0-9]+=/ {
+		n = NF
+		ips   = trim($3)
+		doms  = trim($4)
+		port  = trim($n)
+		if (port != "443") next          # 只要 HTTPS，UDP/游戏端口交给隧道
+		if (doms == "") next
+		if (ips == "") ips = pool[sec]
+		if (ips == "") next
+		split(ips, ia, ",")
+		split(doms, da, ",")
+		for (i in da) {
+			d = trim(da[i])
+			if (d == "") continue
+			gsub(/^\*\./, "", d)
+			for (j in ia) {
+				ip = trim(ia[j])
+				if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)
+					printf "%s\t%s\tusbeam\n", d, ip
+			}
+		}
+	}
+	' "$f" >> "$WORK/all.tsv"
+
+	# 兜底：IPLIST 里的通用反代能响应任意 SNI，对 Watt 覆盖不到的老站也有效。
+	# 不指定域名就没有意义（DNS 改写必须有域名），所以只记录到 generic 列表。
+	awk -F'=' '
+	/^IPLIST=/ { print $2 }
+	' "$f" | tr ',' '\n' | grep -E '^[0-9.]+$' | sort -u > "$WORK/generic-ips.txt"
+
+	log "usbeam: $(grep -c 'usbeam$' "$WORK/all.tsv" 2>/dev/null || echo 0) 条, 通用IP $(wc -l < "$WORK/generic-ips.txt" 2>/dev/null || echo 0) 个"
+}
+
+# ---------- 2. steamcommunity 302 ----------
+# Caddyfile 结构：
+#   https://steamcommunity.com:14086 { ... reverse_proxy @x https://str001.steam302.xyz ... }
+#   https://gist.github.com:14086    { ... reverse_proxy https://ghgist.steam302.xyz ... }
+# 所以要跟踪"当前块是哪个源站"，才能把上游对上。
+sync_302() {
+	local f="$WORK/c302.txt"
+
+	fetch_gh "YoseR1cho/steamcommunity_302_V12.0.4/master/steamcommunity_302.caddy.json" "$f" \
+		|| { log "302: fetch failed"; return 1; }
+	grep -q 'steam302\.xyz' "$f" || { log "302: no upstream found"; return 1; }
+
+	awk '
+	BEGIN { host = "" }
+	# 每个 server 块的起始行
+	/^https?:\/\/[A-Za-z0-9._-]+:1[0-9]{4}/ {
+		host = $0
+		sub(/^https?:\/\//, "", host)
+		sub(/:.*$/, "", host)
+		next
+	}
+	/reverse_proxy/ {
+		if (host == "") next
+		# 行内可能一次列多个上游
+		n = split($0, tok, " ")
+		for (i = 1; i <= n; i++) {
+			u = tok[i]
+			if (u !~ /steam302\.xyz/) continue
+			sub(/^https?:\/\//, "", u)
+			sub(/[^A-Za-z0-9._-].*$/, "", u)
+			if (u != "") printf "%s\t%s\tsteam302\n", host, u
+		}
+	}
+	' "$f" >> "$WORK/all.tsv"
+
+	log "302: $(grep -c 'steam302$' "$WORK/all.tsv" 2>/dev/null || echo 0) 条"
+}
+
+# ---------- 3. gh-proxy 镜像清单 ----------
+# 这类是 URL 前缀反代（https://镜像/https://github.com/...），不是 DNS 通道，
+# 所以不写进 extra.tsv。只落一份列表，给固件的软件源/更新用。
+sync_ghproxy() {
+	local f="$WORK/mirrors.json"
+
+	fetch_gh "weekoo2025/ghproxy/main/mirrors.json" "$f" \
+		|| { log "ghproxy: fetch failed"; return 1; }
+	grep -q 'github_mirrors' "$f" || { log "ghproxy: bad json"; return 1; }
+
+	python3 - "$f" > "$WORK/gh-mirrors.txt" 2>/dev/null <<'PY' || \
+		sed -n 's/.*"\(https:\/\/[^"]*\)".*/\1/p' "$f" | sort -u > "$WORK/gh-mirrors.txt"
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+for k in ("github_mirrors", "docker_mirrors"):
+    v = d.get(k) or {}
+    for u in (v.get("urls") or []):
+        if not u.startswith("http"):
+            continue
+        if "docker" in k and "github" not in k and "docker" not in u:
+            continue
+        print(u)
+PY
+
+	log "ghproxy: $(wc -l < "$WORK/gh-mirrors.txt" 2>/dev/null || echo 0) 个镜像"
+}
+
+# ---------- 跑 ----------
+[ "$sync_usbeam"  = "1" ] && sync_usbeam
+[ "$sync_302"     = "1" ] && sync_302
+[ "$sync_ghproxy" = "1" ] && sync_ghproxy
+
+# ---------- 敏感域名过滤 ----------
+#
+# 这些节点是用 Let's Encrypt 证书终结 TLS 的（证书签发对象是源站域名），
+# 也就是它们能看到明文。把登录/账号/支付类域名指过去 = 把凭据交给陌生人。
+# 所以这类域名一律不写进通道表，保持直连。
+is_sensitive() {
+	case "$1" in
+	account|account.*|accounts|accounts.*|login|login.*|signin|signin.*|logon|logon.*) return 0 ;;
+	auth|auth.*|oauth|oauth.*|sso|sso.*|passport|passport.*) return 0 ;;
+	pay|pay.*|payment|payment.*|checkout|checkout.*|billing|billing.*|wallet|wallet.*) return 0 ;;
+	password|password.*|mail|mail.*|email|email.*|sms|sms.*) return 0 ;;
+	verify|verify.*|verification|verification.*|token|token.*|security|security.*) return 0 ;;
+	*account-*|*-account|*login-*|*-login|*auth-*|*-auth|*pay-*|*-pay) return 0 ;;
+	esac
+	# 子域名形态：xxx.account.foo.com / xxx-login.foo.com
+	case "$1" in
+	*.account.*|*.accounts.*|*.login.*|*.signin.*|*.auth.*|*.oauth.*|*.sso.*) return 0 ;;
+	*.payment.*|*.checkout.*|*.billing.*|*.wallet.*|*.password.*) return 0 ;;
+	*.mail.*|*.email.*|*.sms.*|*.verify.*) return 0 ;;
+	*-account.*|*-login.*|*-auth.*|*-pay.*) return 0 ;;
+	esac
+	return 1
+}
+
+# ---------- 合并、去重、限量 ----------
+# 同一个 (domain, ip) 只留一条，源名保留先到的（usbeam 优先级高于 302）
+if [ -s "$WORK/all.tsv" ]; then
+	awk -F'\t' '!seen[$1"\t"$2]++' "$WORK/all.tsv" > "$WORK/merged.tsv"
+	# 单域 IP 上限 8 个，避免 dnsmasq 配置膨胀（它也只会轮询，多的没意义）
+	awk -F'\t' '{ c[$1]++; if (c[$1] <= 8) print }' "$WORK/merged.tsv" > "$WORK/capped.tsv"
+	mv "$WORK/capped.tsv" "$WORK/merged.tsv"
+else
+	: > "$WORK/merged.tsv"
+fi
+
+if [ ! -s "$WORK/merged.tsv" ]; then
+	log "所有源都失败，保留现有通道"
+	exit 1
+fi
+
+# 域名合法性过滤：只留正常主机名，去掉 @domain / Github 这类脏值
+awk -F'\t' '$1 ~ /^([a-z0-9_]([a-z0-9_-]*[a-z0-9_])?\.)+[a-z]{2,}$/ &&
+             $2 ~ /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/' "$WORK/merged.tsv" > "$WORK/final.tsv"
+
+# 敏感域名剔除（逐个过，ash 里没别的办法）
+: > "$WORK/safe.tsv"
+n_sens=0
+while IFS= read -r line; do
+	d=${line%%	*}
+	if is_sensitive "$d"; then
+		n_sens=$((n_sens + 1))
+	else
+		echo "$line" >> "$WORK/safe.tsv"
+	fi
+done < "$WORK/final.tsv"
+[ "$n_sens" -gt 0 ] && log "剔除 $n_sens 条账号/支付类域名（不交给第三方反代）"
+
+mv "$WORK/safe.tsv" "$OUT.tmp"
+mv "$OUT.tmp" "$OUT"
+chmod 644 "$OUT"
+
+# 通用反代 IP 单独存，供 LuCI 展示 / 手动填
+[ -s "$WORK/generic-ips.txt" ] && cp "$WORK/generic-ips.txt" "$RULES_DIR/generic-ips.txt"
+[ -s "$WORK/gh-mirrors.txt" ]  && cp "$WORK/gh-mirrors.txt"  "$RULES_DIR/gh-mirrors.txt"
+
+date +%s > "$TMP/last_sync"
+
+log "完成: $(wc -l < "$OUT") 条通道, $(cut -f1 "$OUT" | sort -u | wc -l) 个域名, $(cut -f2 "$OUT" | sort -u | wc -l) 个 IP"
+exit 0

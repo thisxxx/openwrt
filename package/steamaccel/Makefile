@@ -61,12 +61,17 @@ define Package/steamaccel/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/steamaccel-update $(1)/usr/sbin/steamaccel-update
 	$(INSTALL_BIN) ./files/steamaccel-apply $(1)/usr/sbin/steamaccel-apply
+	$(INSTALL_BIN) ./files/steamaccel-sync $(1)/usr/sbin/steamaccel-sync
 
 	$(INSTALL_DIR) $(1)/usr/lib/steamaccel
 	$(INSTALL_DATA) ./files/gen.lua $(1)/usr/lib/steamaccel/gen.lua
 
 	$(INSTALL_DIR) $(1)/usr/share/steamaccel
 	$(INSTALL_DATA) ./files/rules.json $(1)/usr/share/steamaccel/rules.json
+
+	# 第三方通道的内置快照：首次开机、还没网时也能用
+	$(INSTALL_DIR) $(1)/etc/steamaccel
+	$(INSTALL_DATA) ./files/extra.tsv $(1)/etc/steamaccel/extra.tsv
 
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/steamaccel.init $(1)/etc/init.d/steamaccel

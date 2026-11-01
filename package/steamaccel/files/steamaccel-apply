@@ -160,9 +160,23 @@ ndead=$( [ -s "$DEAD" ] && wc -l < "$DEAD" || echo 0 )
 updated=$(cat "$TMP/last_update" 2>/dev/null || echo 0)
 [ "$updated" = "0" ] && updated=$(stat -c %Y "$SRC" 2>/dev/null || echo 0)
 
+# 同步来的通道：条数 / 域名数 / 上游数 / 各来源分布
+EXTRAS="/etc/steamaccel/extra.tsv"
+ex_n=0; ex_dom=0; ex_up=0; ex_ts=0; ex_src=""
+if [ -s "$EXTRAS" ]; then
+	ex_n=$(wc -l < "$EXTRAS")
+	ex_dom=$(cut -f1 "$EXTRAS" | sort -u | wc -l)
+	ex_up=$(cut -f2 "$EXTRAS" | sort -u | wc -l)
+	ex_ts=$(cat "$TMP/last_sync" 2>/dev/null || stat -c %Y "$EXTRAS" 2>/dev/null || echo 0)
+	ex_src=$(cut -f3 "$EXTRAS" | sort -u | tr '\n' ' ')
+fi
+# 实际生效的同步行数（探活后可能少于总数）
+ex_live=$(sed -n '/synced channels/,/end synced channels/p' "$OUT" 2>/dev/null | grep -c '^\(address\|cname\)=' || echo 0)
+bypass_n=$( [ -s "$TMP/bypass.txt" ] && wc -l < "$TMP/bypass.txt" || echo 0 )
+
 cat > "$TMP/status.json" <<EOF
-{"total":${total:-0},"cname":${ncname:-0},"address":${naddr:-0},"dead":${ndead:-0},"updated":${updated:-0},"source":"$(basename "$SRC")"}
+{"total":${total:-0},"cname":${ncname:-0},"address":${naddr:-0},"dead":${ndead:-0},"updated":${updated:-0},"source":"$(basename "$SRC")","extra_total":${ex_n:-0},"extra_live":${ex_live:-0},"extra_domains":${ex_dom:-0},"extra_upstreams":${ex_up:-0},"extra_updated":${ex_ts:-0},"extra_sources":"${ex_src}","bypass":${bypass_n:-0}}
 EOF
 
-log "applied: total=$total cname=$ncname address=$naddr dead=$ndead"
+log "applied: total=$total cname=$ncname address=$naddr dead=$ndead synced=$ex_live/$ex_n bypass=$bypass_n"
 exit 0

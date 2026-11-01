@@ -43,9 +43,11 @@ return view.extend({
 		};
 
 		var dead = Number(st.dead) || 0;
+		var exTotal = Number(st.extra_total) || 0;
+		var exLive = Number(st.extra_live) || 0;
+		var lost = exTotal > 0 ? exTotal - exLive : 0;
 
-		return E('div', { 'class': 'cbi-section' }, [
-			E('h3', {}, _('当前状态')),
+		var rows = [
 			mk(_('生效规则'), fmtNum(st.total) + ' ' + _('条')),
 			mk(_('其中 cname 重写'), fmtNum(st.cname) + ' ' + _('条')),
 			mk(_('其中直指 IP'), fmtNum(st.address) + ' ' + _('条')),
@@ -53,7 +55,26 @@ return view.extend({
 				dead > 0 ? 'text-danger' : ''),
 			mk(_('上次更新'), fmtTime(st.updated)),
 			mk(_('数据来源'), st.source || '-')
-		]);
+		];
+
+		if (exTotal > 0) {
+			rows.push(E('h3', { style: 'margin-top:1.5em' }, _('第三方通道（优先）')));
+			rows.push(mk(_('同步通道条目'), fmtNum(exTotal) + ' ' + _('条')));
+			rows.push(mk(_('实际生效'), fmtNum(exLive) + ' ' + _('条'),
+				exLive === 0 ? 'text-danger' : ''));
+			if (lost > 0)
+				rows.push(mk(_('探活剔除'), fmtNum(lost) + ' ' + _('条'), 'text-warning'));
+			rows.push(mk(_('覆盖域名'), fmtNum(st.extra_domains) + ' ' + _('个')));
+			rows.push(mk(_('不同上游'), fmtNum(st.extra_upstreams) + ' ' + _('个')));
+			rows.push(mk(_('来源'), st.extra_sources || '-'));
+			rows.push(mk(_('上次同步'), fmtTime(st.extra_updated)));
+		}
+
+		if (st.bypass)
+			rows.push(mk(_('直连白名单 IP'), fmtNum(st.bypass) + ' ' + _('个'),
+				_('这些 IP 由规则通道优先使用，不会被隧道抢走')));
+
+		return E('div', { 'class': 'cbi-section' }, [E('h3', {}, _('当前状态'))].concat(rows));
 	},
 
 	render: function (data) {
@@ -76,14 +97,32 @@ return view.extend({
 		s.option(form.Value, 'mirror', _('备用镜像'),
 			_('官方接口不通时改从这个地址 GET 规则文件，留空则不用'));
 
-		var o = s.option(form.ListValue, 'update_interval', _('自动更新'),
-			_('规则本身变化很慢，一天一次足够'));
+		var o = s.option(form.ListValue, 'update_interval', _('同步间隔'),
+			_('每次同步做三件事：拉官方规则 → 拉第三方通道 → 合并生效'));
 		o.value('0', _('仅开机时'));
 		o.value('6', _('每 6 小时'));
 		o.value('12', _('每 12 小时'));
 		o.value('24', _('每 24 小时'));
 		o.value('72', _('每 3 天'));
 		o.default = '24';
+
+		// ---- 第三方通道 ----
+		var x = m.section(form.NamedSection, 'main', 'steamaccel', _('第三方通道同步'),
+			_('这些老牌工具各自维护节点，更新比官方勤，官方规则失效时往往还活着。' +
+			  '同步来的通道排在官方规则之前生效。'));
+
+		x.anonymous = true;
+
+		x.option(form.Flag, 'sync_usbeam', _('UsbEAm'),
+			_('dogfight360/UsbEAm 的规则库：[Reverse proxy] 段含 4 个通用 SNI 反代 IP，' +
+			  '以及各游戏平台/CDN 的 443 上游。'));
+
+		x.option(form.Flag, 'sync_302', _('Steamcommunity 302'),
+			_('从发布包的 Caddyfile 里读出上游：str001-003 与 gh*.steam302.xyz 共 14 个。'));
+
+		x.option(form.Flag, 'sync_ghproxy', _('GitHub 镜像清单'),
+			_('weekoo2025/ghproxy 的 mirrors.json。这是 URL 前缀镜像（不是 DNS 通道），' +
+			  '只写进清单备用，不参与域名改写。'));
 
 		var t = m.section(form.NamedSection, 'main', 'steamaccel', _('探活与分流'));
 		t.anonymous = true;
@@ -98,30 +137,53 @@ return view.extend({
 			_('在 443 上按 ClientHello 里的 SNI 把连接导到不同上游，不做 TLS 终结。' +
 			  '未安装 nginx 时此项无效。')).rmempty = false;
 
-		var statusNode = this.renderStatus(st);
-		var updateNode = E('div', { 'class': 'cbi-page-actions' }, [
-			E('button', {
-				'class': 'btn cbi-button cbi-button-action',
-				'click': ui.createHandlerFn(this, function () {
-					this.btnBusy(true);
-					return fs.exec('/usr/sbin/steamaccel-update', ['--force'])
+		var statusBox = E('div', {});
+		statusBox.appendChild(this.renderStatus(st));
+
+		var refresh = function () {
+			return fs.read('/tmp/steamaccel/status.json').then(function (raw) {
+				var node = self.renderStatus(self.parseStatus(raw));
+				while (statusBox.firstChild)
+					statusBox.removeChild(statusBox.firstChild);
+				statusBox.appendChild(node);
+			});
+		};
+
+		var mkBtn = function (label, cmd, args, cls) {
+			return E('button', {
+				'class': 'btn cbi-button ' + (cls || 'cbi-button-action'),
+				'style': 'margin-right:8px',
+				'click': ui.createHandlerFn(self, function () {
+					return fs.exec(cmd, args)
 						.then(function (r) {
 							ui.addNotification(null,
-								E('p', {}, _('更新已执行，返回码 ') + r.code), 'info');
-							return fs.read('/tmp/steamaccel/status.json');
-						})
-						.then(function (raw) {
-							statusNode.replaceWith(self.renderStatus(self.parseStatus(raw)));
+								E('p', {}, label + _(' 已执行，返回码 ') + r.code),
+								r.code === 0 ? 'info' : 'warning');
+							return refresh();
 						})
 						.catch(function (e) {
-							ui.addNotification(null, E('p', {}, _('更新失败：') + e), 'danger');
+							ui.addNotification(null, E('p', {}, label + _(' 失败：') + e), 'danger');
 						});
 				})
-			}, _('立即更新规则'))
+			}, label);
+		};
+
+		var updateNode = E('div', { 'class': 'cbi-page-actions' }, [
+			mkBtn(_('同步规则与通道'), '/usr/sbin/steamaccel-update', ['--force']),
+			mkBtn(_('仅同步通道'), '/usr/sbin/steamaccel-sync', [], 'cbi-button-action'),
+			E('button', {
+				'class': 'btn cbi-button cbi-button-reset',
+				'click': ui.createHandlerFn(self, function () {
+					return fs.exec('/usr/sbin/steamaccel-apply', []).then(function () {
+						ui.addNotification(null, E('p', {}, _('已重新应用')), 'info');
+						return refresh();
+					});
+				})
+			}, _('重新应用'))
 		]);
 
 		return m.render().then(function (node) {
-			return E('div', {}, [node, statusNode, updateNode]);
+			return E('div', {}, [node, statusBox, updateNode]);
 		});
 	},
 

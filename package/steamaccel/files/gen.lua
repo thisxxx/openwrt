@@ -35,16 +35,66 @@ end
 
 local MODE = "dnsmasq"
 local INPUT = nil
+local EXTRA = "/etc/steamaccel/extra.tsv"
 for i = 1, #arg do
     if arg[i] == "--mode" then
         MODE = arg[i + 1] or "dnsmasq"
-    elseif not arg[i]:match("^%-%-") and not (i > 1 and arg[i - 1] == "--mode") then
+    elseif arg[i] == "--extra" then
+        EXTRA = arg[i + 1]
+    elseif not arg[i]:match("^%-%-") and not (i > 1 and (arg[i - 1] == "--mode" or arg[i - 1] == "--extra")) then
         INPUT = arg[i]
     end
 end
 if not INPUT then
-    io.stderr:write("usage: gen.lua <rules.json> [--mode dnsmasq|nginx|json]\n")
+    io.stderr:write("usage: gen.lua <rules.json> [--mode dnsmasq|nginx|json] [--extra extra.tsv]\n")
     os.exit(2)
+end
+
+-- ---------------------------------------------------------------- 第三方通道
+--
+-- extra.tsv 是 steamaccel-sync 从 UsbEAm / steamcommunity302 同步来的通道，
+-- 格式 domain<TAB>ip<TAB>source。它们排在 Watt 规则之前输出：
+--   1. 这些源更新更勤（UsbEAm 的 IP 池是人工维护的当前可用节点）
+--   2. 官方规则失效时它们往往还活着，是"规则通道先走"的第一道保险
+local extra_lines = {}      -- { line=, src=, dom=, ip= }
+local extra_domains = {}    -- domain -> true，用于让 Watt 侧避让
+local extra_stat = { dom = 0, ip = 0, cname = 0 }
+
+do
+    local ef = io.open(EXTRA, "r")
+    if ef then
+        local emitted = {}
+        for line in ef:lines() do
+            line = line:gsub("\r", "")
+            local d, up, src = line:match("^([^\t]+)\t([^\t]+)\t(.*)$")
+            if d and up and d ~= "" then
+                local l, ip
+                if up:match("^%d+%.%d+%.%d+%.%d+$") then
+                    -- 上游是 IP：直接给 A 记录
+                    ip = up
+                    l = "address=/" .. d .. "/" .. up
+                elseif up:match("^[%w][%w%.%-%_]*%.?$") and up:find("%.") then
+                    -- 上游是域名（如 302 的 ghapi.steam302.xyz）：cname 让客户端自己解析，
+                    -- 保留 CDN 就近；这类上游在探活时会先解析成 IP 再验
+                    l = "cname=" .. d .. "," .. up
+                end
+                if l and not emitted[l] then
+                    emitted[l] = true
+                    extra_lines[#extra_lines + 1] = { line = l, src = src or "", dom = d, up = up }
+                    if ip then
+                        extra_stat.ip = extra_stat.ip + 1
+                    else
+                        extra_stat.cname = extra_stat.cname + 1
+                    end
+                end
+                if not extra_domains[d] then
+                    extra_domains[d] = true
+                    extra_stat.dom = extra_stat.dom + 1
+                end
+            end
+        end
+        ef:close()
+    end
 end
 
 local f = io.open(INPUT, "r")
@@ -166,15 +216,38 @@ end
 
 -- ---------------------------------------------------------------- 输出
 
-local stat = { total = #rules, cname = 0, address_ip = 0, address_resolved = 0, unresolved = 0 }
+local stat = { total = #rules, cname = 0, address_ip = 0, address_resolved = 0, unresolved = 0, skipped = 0 }
 
 if MODE == "dnsmasq" then
     print("# steamaccel: generated from api.steampp.net")
     print("# rules: " .. #rules .. "  do not edit, regenerated on update")
+
+    -- 第一段：同步来的第三方通道，排最前
+    if #extra_lines > 0 then
+        print("")
+        print("# --- synced channels (priority) " .. extra_stat.dom .. " domains / " ..
+              extra_stat.ip .. " ip / " .. extra_stat.cname .. " cname ---")
+        for _, e in ipairs(extra_lines) do
+            print(e.line)
+        end
+        print("# --- end synced channels ---")
+    end
+
+    -- 第二段：Watt 官方规则
     local emitted = {}
     for _, r in ipairs(rules) do
+        -- 被同步通道精确覆盖的域名，Watt 侧一律避让。
+        --
+        -- 不叠加的原因：dnsmasq 里同域名的 cname 与 address 是两张表，
+        -- 谁生效取决于版本和查询路径，无法预测。叠加会让"同步来的优先"变成碰运气。
+        --
+        -- 后备不靠这里，靠 steamaccel-apply 的探活：
+        -- 同步通道的 IP/上游全挂 -> 该域名的配置行被整条剔除 -> 走正常解析
+        -- （隧道开着就走隧道），降级路径是通的。
         local line = nil
-        if r.fwd_is_ip then
+        if extra_domains[r.src] then
+            stat.skipped = stat.skipped + 1
+        elseif r.fwd_is_ip then
             line = "address=/" .. r.src .. "/" .. r.fwd
             stat.address_ip = stat.address_ip + 1
         elseif not r.wildcard then
@@ -199,6 +272,18 @@ elseif MODE == "nginx" then
     -- stream + ssl_preread 的 map 片段：只读 ClientHello 的 SNI，不做 TLS 终结
     print("# steamaccel: SNI routing map (no TLS termination)")
     local emitted = {}
+
+    -- 同步通道同样优先
+    for _, e in ipairs(extra_lines) do
+        if e.up and e.up ~= "" then
+            local line = "    " .. e.dom .. "  " .. e.up .. ":443;"
+            if not emitted[line] then
+                emitted[line] = true
+                print(line)
+            end
+        end
+    end
+
     for _, r in ipairs(rules) do
         if not r.fwd_is_ip then
             local target = r.fwd .. ":" .. r.port
@@ -224,6 +309,7 @@ end
 
 if MODE == "dnsmasq" then
     io.stderr:write(string.format(
-        "steamaccel: total=%d cname=%d address(ip)=%d address(resolved)=%d unresolved=%d\n",
-        stat.total, stat.cname, stat.address_ip, stat.address_resolved, stat.unresolved))
+        "steamaccel: extra=%d dom/%d ip/%d cname  watt=%d (cname=%d addr=%d resolved=%d unresolved=%d skipped=%d)\n",
+        extra_stat.dom, extra_stat.ip, extra_stat.cname, stat.total,
+        stat.cname, stat.address_ip, stat.address_resolved, stat.unresolved, stat.skipped))
 end

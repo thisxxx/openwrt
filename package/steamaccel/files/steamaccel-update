@@ -88,22 +88,25 @@ done
 
 if [ "$got" != "1" ]; then
 	log "fetch failed (api=$api), keeping existing rules"
-	exit 1
+	# Watt 的接口挂了不代表第三方通道也挂了，继续同步
+else
+	# 内容没变就不折腾 dnsmasq，但同步那一步照样要跑（它有自己的变更检测）
+	if [ -f "$RULES" ] && cmp -s "$NEW" "$RULES"; then
+		log "rules unchanged"
+		rm -f "$NEW"
+	else
+		cp "$NEW" "$RULES.tmp" && mv "$RULES.tmp" "$RULES" || {
+			log "cannot write $RULES"
+			exit 1
+		}
+		rm -f "$NEW"
+		chmod 644 "$RULES"
+		date +%s > "$TMP/last_update"
+	fi
 fi
 
-# 内容没变就不折腾 dnsmasq
-if [ -f "$RULES" ] && cmp -s "$NEW" "$RULES"; then
-	log "rules unchanged"
-	rm -f "$NEW"
-	exec /usr/sbin/steamaccel-apply
-fi
-
-cp "$NEW" "$RULES.tmp" && mv "$RULES.tmp" "$RULES" || {
-	log "cannot write $RULES"
-	exit 1
-}
-rm -f "$NEW"
-chmod 644 "$RULES"
-date +%s > "$TMP/last_update"
+# 第三方通道同步（UsbEAm / steamcommunity302 / gh-proxy 镜像清单）
+# 它是独立链路，失败只影响 extra.tsv 的新鲜度，不影响 Watt 规则
+[ -x /usr/sbin/steamaccel-sync ] && /usr/sbin/steamaccel-sync
 
 /usr/sbin/steamaccel-apply
