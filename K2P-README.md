@@ -41,7 +41,7 @@ PC 上的 Watt Toolkit（原 Steam++）加速 Steam 社区/商店的方式是：
 | 需求 | 做法 | 说明 |
 |---|---|---|
 | 日常上外网（Google / YouTube 等） | 隧道 + IP 分流 | 全网覆盖 |
-| Steam 社区/商店 | 规则加速 | 隧道开启时自动让位，避免绕路 |
+| Steam 社区/商店 | 规则加速 | 优先直连，隧道不抢这些 IP |
 | 游戏（UDP 联机） | 隧道带 UDP | WireGuard 是三层隧道，UDP 天然支持；延迟取决于出口线路 |
 | 流媒体解锁 | 不保证 | WARP 出口不解锁 Netflix 等版权区 |
 
@@ -104,15 +104,41 @@ sing-box 1.14.4 的 linux-mipsle 压缩包 24 MB，解压后约 40 MB，squashfs
 
 **分流原理**
 
+分三级，先走免费的，走不通才用兜底的。
+
+| 优先级 | 命中条件 | 去向 | 说明 |
+|---|---|---|---|
+| 1 | 域名命中 steamaccel 规则 | **直连**（公益反代 / 优选 IP） | IP 进 nft `fast` 集合，在 cn 判断之前放行 |
+| 2 | IP 在国内段 | **直连** | 3888 条 BGP 聚合段 |
+| 3 | 以上都不命中 | **走 WARP 隧道** | 打 mark 0x77 → 表 77 → warp0 |
+
 ```sh
-# 国内段直连
+# 1. 规则通道优先（免费反代，直连最快）
+nft add rule inet warp pre ip daddr @fast return
+# 2. 国内直连
 nft add rule inet warp pre ip daddr @cn4 return
-# 其余打标
+# 3. 其余打标走隧道
 nft add rule inet warp pre meta mark set 0x77
 # 策略路由
 ip rule add fwmark 0x77 lookup 77 priority 100
 ip route replace default dev warp0 table 77
 ```
+
+**「走不通才走 WARP」是怎么自动发生的**
+
+不需要额外的健康检查逻辑，靠 steamaccel 的探活就够了：
+
+```
+反代挂了
+  → steamaccel 探活 TCP 443 失败
+  → 把这条规则整条剔除，不写进 dnsmasq
+  → 域名回到 warp-dns.conf 的 server= 分支
+  → 经隧道用 1.1.1.1 解析真实 IP（不污染）
+  → 真实 IP 不在 fast、不在 cn → 走隧道 → 通
+```
+
+这也是为什么 cname 类规则现在也探活 —— 以前只验写死 IP 的那些，
+而 cname 恰恰是「反代挂了但域名还解析得到」的情况，不验就会写死一条死路。
 
 关键点：**绝不改动系统默认路由**。只建独立的表 77，隧道挂了整网自动回到直连，
 不会出现「加速器一挂、全家断网」。
