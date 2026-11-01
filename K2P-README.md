@@ -1,4 +1,4 @@
-# K2P OpenWrt 固件 —— 网络加速 + EasyTier
+# K2P OpenWrt 固件 —— 规则加速 + WireGuard 出口 + EasyTier
 
 斐讯 K2P A1/A2（MT7621A + MT7615D / 16MB NOR / 128MB RAM）专用固件。
 
@@ -7,6 +7,10 @@
 ---
 
 ## 这个固件解决什么
+
+分两层，解决的是两类完全不同的问题。
+
+**第一层：规则加速**（`steamaccel`）—— 把特定域名指到能通的镜像，不加密、不解密。
 
 PC 上的 Watt Toolkit（原 Steam++）加速 Steam 社区/商店的方式是：
 改 hosts 把域名指到 `127.0.0.1` → 本机起 Kestrel 反代 → 自签根证书做 TLS 中间人 → 换个能通的上游。
@@ -21,10 +25,25 @@ PC 上的 Watt Toolkit（原 Steam++）加速 Steam 社区/商店的方式是：
 | 规则远程下发 | `POST api.steampp.net/accelerator/projectgroups` | 否 |
 | 内容改写（注入脚本） | 不做 | — |
 | UA 伪造 | 不做 | — |
-| 游戏 UDP 加速 | 不做（迅游闭源 SDK 无法移植） | — |
+
+**第二层：出口**（`warp-wg`）—— 真正把流量送到境外，覆盖全部站点。
+
+规则加速只能救「有第三方公益反代可用」的域名，Google / YouTube / Telegram 这类
+没有任何人给你做反代的站点，改 DNS 是救不回来的 —— 必须真有一个境外出口。
+
+这一层用内核 WireGuard：**国内 IP 直连，其余全部走隧道**。
+判断依据是目的 IP 落在不落在 3888 条国内段里，**不依赖任何域名清单**，
+所以「支持多少站点」这个问题不存在 —— 不在国内的全走隧道。
 
 结果是：**任何设备接上这个路由器就生效，一台都不需要装根证书**，包括 PS5、Xbox、
 电视盒子这类根本装不了证书的设备。
+
+| 需求 | 做法 | 说明 |
+|---|---|---|
+| 日常上外网（Google / YouTube 等） | 隧道 + IP 分流 | 全网覆盖 |
+| Steam 社区/商店 | 规则加速 | 隧道开启时自动让位，避免绕路 |
+| 游戏（UDP 联机） | 隧道带 UDP | WireGuard 是三层隧道，UDP 天然支持；延迟取决于出口线路 |
+| 流媒体解锁 | 不保证 | WARP 出口不解锁 Netflix 等版权区 |
 
 ---
 
@@ -62,6 +81,68 @@ uci add_list easytier.main.peers='tcp://public.easytier.cn:11010'
 uci commit easytier
 /etc/init.d/easytier restart
 ```
+
+### package/warp-wg
+
+出口层。内核 WireGuard + nftables 分流，**没有用户态代理进程**。
+
+| 文件 | 作用 |
+|---|---|
+| `files/warp-register` | 自己生成 x25519 密钥对，调 Cloudflare 注册接口拿 WARP 账号 |
+| `files/warp-scan` | 逐个试 27 个 endpoint 候选（2408/500/1701/4500 多端口），靠握手判断 |
+| `files/warp-route` | nftables set + fwmark + 策略路由，国内直连其余走隧道 |
+| `files/warp-status` | 状态汇总，命令行与 LuCI 共用 |
+| `files/warp-wg.init` | procd 服务 + 看门狗 |
+| `files/chnroute.txt` | 3888 条国内 IPv4 段（BGP 聚合） |
+| `files/cn-domains.txt` | 国内域名，决定 DNS 走哪个上游 |
+
+**为什么不用 mihomo / sing-box**
+
+sing-box 1.14.4 的 linux-mipsle 压缩包 24 MB，解压后约 40 MB，squashfs 压完还要 7-8 MiB，
+而分区只剩 6.7 MiB。内核 WireGuard 一共 150 KB，且是内核态转发 —— MT7621 上
+内核 WireGuard 能跑 50-80 Mbps，用户态代理在同一个 CPU 上只有 20-40 Mbps。
+
+**分流原理**
+
+```sh
+# 国内段直连
+nft add rule inet warp pre ip daddr @cn4 return
+# 其余打标
+nft add rule inet warp pre meta mark set 0x77
+# 策略路由
+ip rule add fwmark 0x77 lookup 77 priority 100
+ip route replace default dev warp0 table 77
+```
+
+关键点：**绝不改动系统默认路由**。只建独立的表 77，隧道挂了整网自动回到直连，
+不会出现「加速器一挂、全家断网」。
+
+**DNS 一并处理**
+
+只做 IP 分流是不够的 —— 解析若先被污染，拿到的是假 IP，走隧道也连不上真站点。
+所以隧道起来时同时切换 DNS：
+
+```
+国内域名  → 223.5.5.5（就近 CDN）
+其余域名  → 1.1.1.1（经隧道，不被污染）
+```
+
+**用法**
+
+```sh
+warp-register        # 注册 WARP，拿到账号
+warp-scan            # 优选一个能握手的 endpoint
+uci set warp-wg.cfg.enabled=1
+uci commit warp-wg
+/etc/init.d/warp-wg restart
+warp-status          # 看握手、流量、规则条数
+```
+
+或者直接在 LuCI「服务 → 网络加速 → 出口（WARP）」点三个按钮。
+
+**换成自己的节点**：任何标准 WireGuard 服务端都能直接替换 —— 把
+`private_key` / `peer_public_key` / `endpoint` / `address4` 填成自己的即可，
+分流、DNS、看门狗全部复用。
 
 ### package/luci-app-steamaccel
 
@@ -123,7 +204,13 @@ make -j$(nproc)
 | firmware 分区 | 16,121,856 B（15.375 MiB，`0xa0000 + 0xf60000`） |
 | `IMAGE_SIZE` | 15744k（与上一致） |
 | 官方 v23.05.6 基座 | 7,012,938 B |
+| easytier-lite | 6,698,364 B（压缩后约 1.9 MiB） |
+| warp-wg（脚本 + IP 段） | 约 140 KB（压缩后约 30 KB） |
+| kmod-wireguard + wireguard-tools | 约 150 KB |
+| steamaccel + luci | 约 60 KB |
 | **本固件实测** | 见 Release 里的 `size-report.md` |
+
+预算约 8.9 MiB，分区 15.375 MiB，余量 6 MiB 以上。
 
 squashfs 块大小从默认 256 KiB 提到 512 KiB：Rust/Go 这类静态大二进制
 （符号表、字符串表、pclntab）跨块才有冗余，256K 块会把压缩率吃掉一截。
@@ -141,3 +228,13 @@ squashfs 块大小从默认 256 KiB 提到 512 KiB：Rust/Go 这类静态大二�
    想让下载变快得在 Steam 客户端里手动换下载区域。
 4. **规则接口没有版本号**。响应头无 ETag / Cache-Control，每次都是全量 28 KB，
    只能整份比对判断变没变。
+5. **WARP 在国内不一定连得上**。Cloudflare 的 WARP 边缘这两年封锁程度不稳定，
+   能不能通完全看当地运营商。`warp-scan` 提供 27 个候选（含 500/1701/4500 端口变体），
+   全不通就只能换自己的节点。这不是固件能解决的问题。
+6. **WARP 不解锁流媒体**。Cloudflare 的出口 IP 会被 Netflix / Disney+ 识别为数据中心，
+   想看流媒体版权内容得换有机场节点或自建。
+7. **隧道不加速游戏**。WireGuard 三层隧道能带 UDP，游戏能走，
+   但延迟取决于出口绕行距离 —— WARP 出口多在美西，国内游戏走它反而更高。
+   真要做游戏加速需要的是就近的游戏专线（迅游那种），本固件做不到。
+8. **MT7621 没有 AES 指令集**。WireGuard 默认用 ChaCha20-Poly1305，
+   在这个 CPU 上约 50-80 Mbps 上限，跑满百兆宽带够用，跑千兆不够。
